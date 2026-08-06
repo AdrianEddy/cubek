@@ -5,7 +5,8 @@ use cubecl::{
     quant::scheme::{QuantLevel, QuantParam, QuantScheme, QuantStore, QuantValue},
 };
 use cubek_tile::{
-    Axis, ByAxis, Distribution, Partitioner, QuantTileArg, Space, StridedOperand, TileArg, Until,
+    Axis, ByAxis, DequantAt, Distribution, Partitioner, QuantTileArg, Space, StridedOperand,
+    TileArg,
 };
 
 // Input axes
@@ -40,6 +41,15 @@ pub fn launch_ref<R: Runtime>(
     // One space for the whole kernel; both operands span all of it. Geometry reads the
     // concrete extents; the kernel gets the dynamic form, so m and n resolve in-kernel
     // from the tensor's own shape and never fork the compiled kernel.
+    // The space is read off the first two dims, so a deeper buffer would be described by its grid
+    // dims rather than its extents. Both operands are plain 2-D tensors: every axis untiled, one
+    // physical axis apiece, which is what the source builder derives below.
+    assert!(
+        input.shape.len() == 2 && output.shape.len() == 2,
+        "dequantize_tiled: both operands must be plain 2-D tensors, got {:?} and {:?}",
+        input.shape,
+        output.shape
+    );
     let space = sequential_space(&[(M, input.shape[0]), (N, input.shape[1])]);
     let cube_count = space.cube_count();
     let cube_dim = space.cube_dim(client);
@@ -52,7 +62,7 @@ pub fn launch_ref<R: Runtime>(
         .subspace(&[M, N])
         .checked(false)
         // Nothing stages this operand, so its read is what decodes it.
-        .quantized(scales.into_tensor_arg(), *scheme, Until::Read)
+        .quantized(scales.into_tensor_arg(), *scheme, DequantAt::Read)
         .build();
     let output_op = StridedOperand::source(output)
         .space(&space)

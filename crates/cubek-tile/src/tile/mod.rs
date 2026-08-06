@@ -81,12 +81,14 @@ impl<T: Numeric> TileKind<T> {
     }
 }
 
-/// How far an operand's quantized form travels before something decodes it. Stated at launch,
-/// once: the quantized form ends at one boundary. Which values are available is fixed by what the
-/// operand's transports can decode, never by preference, so a stated value is either the one that
-/// was left or a genuine fork between stage size and per-read cost.
+/// Where an operand's quantized form is decoded: the one site that turns stored values into served
+/// ones. Stated at launch, once, since the quantized form ends at exactly one boundary. Which sites
+/// are available is fixed by what the operand's transports can decode, never by preference, so a
+/// stated value is either the one that was left (which
+/// [`build`](crate::StridedTileSource::build) enforces) or a genuine fork between stage size and
+/// per-read cost.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Until {
+pub enum DequantAt {
     /// The load into the stage decodes; the stage holds served values, so it inflates by the
     /// served-to-stored ratio and the achievable stage depth drops with it.
     Load,
@@ -110,7 +112,7 @@ pub struct QuantInfo {
     /// Where this operand's quantized form ends. Read by [`MemData::smem_like`], which is why no
     /// call site asks an operand whether it is quantized before staging it.
     #[cube(comptime)]
-    pub(crate) until: Until,
+    pub(crate) dequant_at: DequantAt,
     /// Per-axis count of distinct scales the buffer holds, set only on a *staged* smem side-channel
     /// ([`MemData::smem_quant`]): the values stage as packed words and their scales stage compactly
     /// beside them, so the fill knows how many blocks to copy. Empty for a gmem operand, which reads
@@ -164,7 +166,7 @@ impl QuantInfo {
             strides: self.strides.clone(),
             window_start: advances.fsum(comptime!((0..rank).collect::<Vec<_>>())),
             block: comptime!(self.block.clone()),
-            until: comptime!(self.until),
+            dequant_at: comptime!(self.dequant_at),
             scale_shape: comptime!(self.scale_shape.clone()),
             scheme: comptime!(self.scheme),
         }
@@ -238,14 +240,15 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
-    /// How far this operand's quantized form travels ([`Until`]). A tile with nothing to decode
-    /// answers [`Until::Load`]: its served and stored elements are the same, so its load already
-    /// delivers what the read wants.
-    pub(crate) fn until(&self) -> comptime_type!(Until) {
+    /// This operand's decode site ([`DequantAt`]). A tile with nothing to decode answers
+    /// [`DequantAt::Load`]: served and stored are the same element, so its load already delivers
+    /// what the read wants and the stage takes that element. A tma source is never quantized, so it
+    /// answers the same for the same reason, not because a bulk copy could decode: it cannot.
+    pub(crate) fn dequant_at(&self) -> comptime_type!(DequantAt) {
         match &self.tile_kind {
-            TileKind::Gmem(d) | TileKind::Smem(d) => d.until(),
+            TileKind::Gmem(d) | TileKind::Smem(d) => d.dequant_at(),
             TileKind::TmaGmem(_) | TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
-                comptime!(Until::Load)
+                comptime!(DequantAt::Load)
             }
         }
     }
@@ -257,6 +260,20 @@ impl<T: Numeric> Tile<T> {
             TileKind::Gmem(d) | TileKind::Smem(d) => d.quant_pack(),
             TileKind::TmaGmem(_) | TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
                 comptime!(0usize)
+            }
+        }
+    }
+
+    /// Whether this tile's buffer is addressed through a non-identity [`Projection`]: a logical
+    /// coordinate is not a physical one, so the only read surface that describes the tile is the
+    /// N-D one ([`nd`](Tile::nd)) and no window of it is dense. False for a
+    /// [`direct`](Projection::direct) operand, and for a fragment or a tensor map, which have no
+    /// buffer to gather from.
+    pub fn gathered(&self) -> comptime_type!(bool) {
+        match &self.tile_kind {
+            TileKind::Gmem(g) | TileKind::Smem(g) => comptime!(!g.projection.is_direct()),
+            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) | TileKind::TmaGmem(_) => {
+                comptime!(false)
             }
         }
     }
