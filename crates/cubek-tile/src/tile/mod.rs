@@ -270,10 +270,18 @@ impl<T: Numeric> Tile<T> {
     /// [`direct`](Projection::direct) operand, and for a fragment or a tensor map, which have no
     /// buffer to gather from.
     pub fn gathered(&self) -> comptime_type!(bool) {
+        let projection = self.projection();
+        comptime!(!projection.is_direct())
+    }
+
+    /// How this tile's logical axes address its buffer's physical ones. A fragment and a tma source
+    /// have no buffer to project onto, so they answer [`direct`](Projection::direct) over their own
+    /// space, which is what every non-gather operand carries anyway.
+    pub(crate) fn projection(&self) -> comptime_type!(Projection) {
         match &self.tile_kind {
-            TileKind::Gmem(g) | TileKind::Smem(g) => comptime!(!g.projection.is_direct()),
+            TileKind::Gmem(g) | TileKind::Smem(g) => comptime!(g.projection.clone()),
             TileKind::PlaneTile(_) | TileKind::PlanePartition(_) | TileKind::TmaGmem(_) => {
-                comptime!(false)
+                comptime!(Projection::direct_over(&self.space))
             }
         }
     }
@@ -452,6 +460,9 @@ impl<T: Numeric> Tile<T> {
     /// transport leaf. A partition source is matched first: it needs the whole
     /// destination tile, which the pairing match below would keep borrowed.
     pub fn copy_from(&mut self, src: &Tile<T>) {
+        // Bound before the match, which borrows the kind: a memory fill needs the logical space
+        // both sides carry (a gathered source is addressed per axis).
+        let space = comptime!(self.space.clone());
         match &src.tile_kind {
             TileKind::PlanePartition(s) => s.drain_into(self),
             TileKind::Gmem(_)
@@ -469,7 +480,7 @@ impl<T: Numeric> Tile<T> {
                 }
                 (TileKind::Smem(d), TileKind::TmaGmem(s)) => s.load_into(d),
                 (TileKind::Gmem(d) | TileKind::Smem(d), TileKind::Gmem(s) | TileKind::Smem(s)) => {
-                    d.fill_from(s)
+                    d.fill_from(s, space)
                 }
                 (TileKind::PlaneTile(_), TileKind::PlaneTile(_)) => {
                     panic!("Tile::copy_from: plane tile to plane tile cast not wired")
