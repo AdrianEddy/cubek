@@ -118,6 +118,25 @@ impl<'a, E: Numeric, V: Size> TileArg<'a, E, V> {
     pub fn tile(&self, #[comptime] space: Space) -> Tile<E> {
         Tile::<E>::of(self.tensor, space, comptime!(self.spec.clone()))
     }
+
+    /// [`tile`](Self::tile) for a gather whose affine map is not all comptime: one value per
+    /// [`Scale::Dynamic`](crate::Scale) term and one signed value per
+    /// [`Offset::Dynamic`](crate::Offset) axis of the spec's projection. See
+    /// [`Tile::of_gathered`].
+    pub fn tile_gathered(
+        &self,
+        #[comptime] space: Space,
+        coefficients: Coords<u32>,
+        offsets: Coords<i32>,
+    ) -> Tile<E> {
+        Tile::<E>::of_gathered(
+            self.tensor,
+            space,
+            comptime!(self.spec.clone()),
+            coefficients,
+            offsets,
+        )
+    }
 }
 
 /// One quantized operand as a single launch argument: the storage-typed values tensor
