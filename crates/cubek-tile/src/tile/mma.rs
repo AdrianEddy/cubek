@@ -130,10 +130,10 @@ impl<T: Numeric> MmaData<T> {
         let io = comptime!(self.io);
         let def = MmaDefinition::<T, T, T>::new(m, n, k);
         match &mut self.fragment {
-            MmaFragment::Lhs(f) => load_fragment(src, f, &def, MatrixIdent::A, layout, io),
-            MmaFragment::Rhs(f) => load_fragment(src, f, &def, MatrixIdent::B, layout, io),
+            MmaFragment::Lhs(f) => load_fragment(src, f, &def, MatrixIdent::A, layout, io, (m, k)),
+            MmaFragment::Rhs(f) => load_fragment(src, f, &def, MatrixIdent::B, layout, io, (k, n)),
             MmaFragment::Acc(f) => {
-                load_fragment(src, f, &def, MatrixIdent::Accumulator, layout, io)
+                load_fragment(src, f, &def, MatrixIdent::Accumulator, layout, io, (m, n))
             }
         }
     }
@@ -211,8 +211,7 @@ fn fill_registers<E: Numeric, N: Size>(fragment: &mut Array<Vector<E, N>>, value
     }
 }
 
-/// Load `fragment` (role `ident`) from `mem`'s row-major window. `ldmatrix` needs a vectorized
-/// row slice, which a `MemData` window cannot serve yet, so that path is refused rather than wrong.
+/// Load `fragment` (role `ident`, shaped by `edges`) from a row-major window.
 #[cube]
 fn load_fragment<T: Numeric, N: Size, A: Numeric, B: Numeric, CD: Numeric>(
     src: &Tile<T>,
@@ -221,9 +220,17 @@ fn load_fragment<T: Numeric, N: Size, A: Numeric, B: Numeric, CD: Numeric>(
     #[comptime] ident: MatrixIdent,
     #[comptime] layout: MatrixLayout,
     #[comptime] io: MmaIOConfig,
+    #[comptime] edges: (usize, usize),
 ) {
-    match io.load_method(ident) {
-        LoadMethod::Manual => load_manual_dispatch(src, fragment, def, ident, layout),
+    // Fall back to manual loading for gathered operands.
+    let gathered = src.gathered();
+    let method = comptime!(if gathered {
+        LoadMethod::Manual
+    } else {
+        io.load_method(ident)
+    });
+    match method {
+        LoadMethod::Manual => load_manual_dispatch(src, fragment, def, ident, layout, edges),
         LoadMethod::LoadMatrix => {
             comptime!(panic!(
                 "MmaData::load: the ldmatrix fast path is not yet wired for MemData windows; \
@@ -243,25 +250,23 @@ fn load_manual_dispatch<T: Numeric, N: Size, A: Numeric, B: Numeric, CD: Numeric
     def: &MmaDefinition<A, B, CD>,
     #[comptime] ident: MatrixIdent,
     #[comptime] layout: MatrixLayout,
+    #[comptime] edges: (usize, usize),
 ) {
     let pack = src.quant_pack();
     let served = src.vector_size();
     let size!(W) = served;
     if comptime!(pack == 1) {
         let size!(WP) = served;
-        load_manual::<T, i8, WP, W, N, A, B, CD>(src, fragment, def, ident, layout);
+        load_manual::<T, i8, WP, W, N, A, B, CD>(src, fragment, def, ident, layout, edges);
     } else if comptime!(pack > 1) {
         let size!(WP) = comptime!(served / pack);
-        load_manual::<T, u32, WP, W, N, A, B, CD>(src, fragment, def, ident, layout);
+        load_manual::<T, u32, WP, W, N, A, B, CD>(src, fragment, def, ident, layout, edges);
     } else {
-        load_manual::<T, T, W, W, N, A, B, CD>(src, fragment, def, ident, layout);
+        load_manual::<T, T, W, W, N, A, B, CD>(src, fragment, def, ident, layout, edges);
     }
 }
 
-/// Manual load: for each register the hardware position `(row, col)` of its element(s), read
-/// through the quant-transparent matrix view, so a stage still holding quantized values decodes
-/// here. `I`/`WP` are the storage element and physical line, `W` the served line; the view serves
-/// whole lines, so the element is lane `col % W` of line `col / W`.
+/// Manual load: reads elements for each register from `src` using the matrix view.
 #[cube]
 fn load_manual<
     T: Numeric,
@@ -278,23 +283,22 @@ fn load_manual<
     def: &MmaDefinition<A, B, CD>,
     #[comptime] ident: MatrixIdent,
     #[comptime] layout: MatrixLayout,
+    #[comptime] edges: (usize, usize),
 ) {
     let num_vectors = def.vectors_per_lane(ident);
     let vector_size = def.vector_size(ident);
     let lane_id = UNIT_POS_PLANE;
     let served = src.vector_size();
     let width = comptime!(served as u32);
-    // The view is shaped `(rows, cols)` by the stage's own space, so a transposed read would
-    // index outside it on a non-square tile. Every `MmaData` constructor states row-major today;
-    // wiring col-major means giving the view a transposing layout, not swapping the coordinates.
+    // Only row-major layout is currently supported for manual fragment loads.
     comptime!(assert!(
         matches!(layout, MatrixLayout::RowMajor),
         "MmaData::load: a manual fragment load reads a row-major stage; \
          {layout:?} is not wired through the matrix view"
     ));
 
-    // A single matrix: an mma tile carries no batch axes.
-    let view = src.matrix_transparent::<I, WP, W>(0usize);
+    let (rows, cols) = comptime!(edges);
+    let view = src.fragment_matrix::<I, WP, W>(rows, cols);
 
     #[unroll]
     for i in 0..num_vectors {

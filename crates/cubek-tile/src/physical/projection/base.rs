@@ -317,6 +317,9 @@ impl Projection {
         // The innermost physical axis is addressed in *lines*, not elements: `MemData::at` divides
         // its edge by the vector size and `of_impl` counts its physical shape in lines. That
         // arithmetic is only sound when it is one logical axis at coefficient 1.
+        //
+        // The other direction, a *coarser* physical axis also scaling that same logical axis,
+        // would mix lines into an element count.
         let innermost = self.axes[self.axes.len() - 1];
         assert!(
             self.physical[self.physical.len() - 1].is_identity(innermost),
@@ -324,18 +327,19 @@ impl Projection {
              coefficient 1 (it is addressed in vector lines)"
         );
         for &axis in self.axes.iter() {
+            let count = self.physical.iter().filter(|m| m.scale(axis) != 0).count();
             assert!(
-                self.physical.iter().any(|m| m.scale(axis) != 0),
+                count > 0,
                 "Projection: logical axis {axis:?} addresses no physical axis"
             );
+            // A gathered operand must be untiled gmem, so each logical axis can map to at most one physical axis.
+            assert!(
+                count == 1,
+                "Projection: logical axis {axis:?} addresses several physical axes, so it is \
+                 either storage-tiled (a gathered operand must be untiled gmem) or read off two \
+                 places at once"
+            );
         }
-        // A tiled `[grid…, tile…]` buffer splits an advance into two digits, which is not linear
-        // in the edge, so it cannot absorb a scaled one. Projected operands are bare gmem.
-        assert!(
-            !self.is_tiled(),
-            "Projection: a gathered operand must be untiled gmem, but an axis is split across \
-             several physical fragments"
-        );
     }
 }
 #[cfg(test)]
@@ -388,6 +392,22 @@ mod tests {
         assert_eq!(q.span(0, |a| if a == A { 4 } else { 1 }), 4);
     }
 
+    /// The innermost axis is addressed in lines, so a coarser physical axis scaling it would mix
+    /// line and element units. Carrying it twice is what storage tiling *is*, so the tiling refusal
+    /// is what rules the shape out. `A <- A*1 + B*2` over logical `[A, B]` with `B` innermost.
+    #[test]
+    #[should_panic(expected = "addresses several physical axes")]
+    fn innermost_axis_rides_no_coarser_physical_axis() {
+        Projection::new(
+            &[A, B],
+            &[
+                PhysicalAxisMap::affine(&[(A, 1), (B, 2)]),
+                PhysicalAxisMap::of(B),
+            ],
+        )
+        .validate();
+    }
+
     #[test]
     #[should_panic(expected = "innermost physical axis")]
     fn innermost_must_be_identity() {
@@ -402,7 +422,7 @@ mod tests {
     /// while `Ih <- A*2 + R*3` gathers, and one advance cannot be both split into digits and
     /// scaled.
     #[test]
-    #[should_panic(expected = "untiled gmem")]
+    #[should_panic(expected = "addresses several physical axes")]
     fn a_gather_rejects_tiled_storage() {
         Projection::new(
             &[A, R, B],

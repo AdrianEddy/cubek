@@ -23,20 +23,61 @@ use crate::*;
 /// and the scales through the same one. A blanket impl, so this bundles bounds rather than naming
 /// a new concept; [`BatchMatrix`](super::BatchMatrix) and [`AxisProjection`] are the two the leaves
 /// read through, and [`StepUp`] rides the same bounds under a fill.
-pub trait TileLayout<C: Coordinates>:
-    Layout<Coordinates = C, SourceCoordinates = CoordsDyn>
-    + Clone
-    + 'static
-    + CubeType<ExpandType: Clone>
+pub trait LogicalLayout:
+    Layout<SourceCoordinates = CoordsDyn> + Clone + 'static + CubeType<ExpandType: Clone>
 {
 }
 
-impl<C: Coordinates, L> TileLayout<C> for L where
-    L: Layout<Coordinates = C, SourceCoordinates = CoordsDyn>
-        + Clone
-        + 'static
-        + CubeType<ExpandType: Clone>
+impl<L> LogicalLayout for L where
+    L: Layout<SourceCoordinates = CoordsDyn> + Clone + 'static + CubeType<ExpandType: Clone>
 {
+}
+
+/// [`LogicalLayout`] answering a particular coordinate `C`, for the readers that name one.
+pub trait TileLayout<C: Coordinates>: LogicalLayout + Layout<Coordinates = C> {}
+
+impl<C: Coordinates, L> TileLayout<C> for L where L: LogicalLayout + Layout<Coordinates = C> {}
+
+/// Any [`LogicalLayout`] with an operand's [`Projection`] applied under it: the inner layout
+/// resolves a reader's coordinate to the tile's *logical* one, then [`AxisProjection`] folds that
+/// onto the window's *physical* one. Every view goes through this, so the two ranks meet in one
+/// place rather than once per reader; under the direct mapping the fold is the identity, which
+/// [`Fold`](crate::Fold) collapses to the coordinate itself.
+#[derive(CubeType, Clone)]
+#[expand(derive(Clone))]
+pub struct Projected<L: LogicalLayout> {
+    inner: L,
+    projection: AxisProjection,
+}
+
+#[cube]
+impl<L: LogicalLayout> Projected<L> {
+    pub fn new(inner: L, projection: AxisProjection) -> Self {
+        Projected::<L> { inner, projection }
+    }
+}
+
+#[cube]
+impl<L: LogicalLayout> Layout for Projected<L> {
+    type Coordinates = L::Coordinates;
+    type SourceCoordinates = CoordsDyn;
+
+    fn to_source_pos(&self, pos: Self::Coordinates) -> Self::SourceCoordinates {
+        self.projection.to_source_pos(self.inner.to_source_pos(pos))
+    }
+
+    fn to_source_pos_checked(&self, pos: Self::Coordinates) -> (Self::SourceCoordinates, bool) {
+        let in_bounds = self.is_in_bounds(pos.clone());
+        (self.to_source_pos(pos), in_bounds)
+    }
+
+    fn shape(&self) -> Self::Coordinates {
+        self.inner.shape()
+    }
+
+    fn is_in_bounds(&self, pos: Self::Coordinates) -> bool {
+        self.inner.is_in_bounds(pos)
+    }
 }
 
 /// A [`Layout`] mapping a tile's logical coordinate to its window's physical one:
@@ -114,14 +155,7 @@ impl Layout for AxisProjection {
     /// The logical box. Whether the physical coordinate it maps to is within the operand's valid
     /// data is the [`Window`](crate::Window)'s question, asked one layer down.
     fn is_in_bounds(&self, pos: Self::Coordinates) -> bool {
-        let mut valid = true;
-
-        #[unroll]
-        for p in 0..self.shape.len() {
-            valid = valid && pos[p] < self.shape.at(p);
-        }
-
-        valid
+        within(&self.shape, pos)
     }
 }
 
@@ -178,17 +212,10 @@ impl Layout for StepUp {
         self.shape.to_dyn()
     }
 
-    /// The compacted box. Whether the source cell it steps up to holds valid data is the
-    /// [`Window`](crate::Window)'s question, asked one layer down.
+    /// The compacted box, the source cell it steps up to being the [`Window`](crate::Window)'s
+    /// question.
     fn is_in_bounds(&self, pos: Self::Coordinates) -> bool {
-        let mut valid = true;
-
-        #[unroll]
-        for p in 0..self.shape.len() {
-            valid = valid && pos[p] < self.shape.at(p);
-        }
-
-        valid
+        within(&self.shape, pos)
     }
 }
 
@@ -225,14 +252,24 @@ pub(crate) fn axis_projection(
     #[comptime] vector_size: usize,
 ) -> AxisProjection {
     let rank = comptime!(space.rank());
-    let last = comptime!(rank - 1);
-    let mut shape = Coords::<u32>::new();
-
-    #[unroll]
-    for p in 0..rank {
-        let e = comptime!(space.extent_at(p));
-        shape.push(comptime!((if p == last { e / vector_size } else { e }) as u32).runtime());
-    }
+    let shape = const_coords(comptime!(line_extents(&space, vector_size, 0, rank)));
 
     AxisProjection::new(shape, space, projection)
+}
+
+/// Returns the extents of `space` in the range `from..to`, with the innermost axis
+/// converted to line count by dividing by `vector_size`.
+pub(crate) fn line_extents(
+    space: &Space,
+    vector_size: usize,
+    from: usize,
+    to: usize,
+) -> Vec<usize> {
+    let last = space.rank() - 1;
+    (from..to)
+        .map(|p| {
+            let e = space.extent_at(p);
+            if p == last { e / vector_size } else { e }
+        })
+        .collect()
 }
