@@ -9,8 +9,8 @@ use cubecl::prelude::*;
 use cubecl::quant::scheme::QuantScheme;
 
 use crate::{
-    Axis, ConcreteLayout, DequantAt, Leaf, LoadMethod, PhysicalAxis, QuantTileArgLaunch, Space,
-    StageStorage, StorageTiling, TileArgLaunch, TileSpec, validate_scheme,
+    Axis, Boundary, ConcreteLayout, DequantAt, Leaf, LoadMethod, PhysicalAxis, QuantTileArgLaunch,
+    Space, StageStorage, StorageTiling, TileArgLaunch, TileSpec, validate_scheme,
 };
 
 /// Typestate marker: a required [`StridedTileSource`] field has been set.
@@ -30,7 +30,7 @@ struct TileSourceData<'a, R: Runtime> {
     /// How the subspace axes are storage-tiled in the binding; `None` is untiled.
     tiling: Option<StorageTiling>,
     v: usize,
-    check: Option<bool>,
+    boundary: Option<Option<Boundary>>,
     stage: Option<StageStorage>,
     /// The launch's cube size (units per cube); set by [`Launcher::arg`](crate::Launcher::arg).
     units: usize,
@@ -62,7 +62,7 @@ impl<'a, R: Runtime> StridedTileSource<'a, Unset, Unset, Unset, R> {
                 batch_axes: &[],
                 tiling: None,
                 v: 1,
-                check: None,
+                boundary: None,
                 stage: None,
                 units: 0,
                 quant: None,
@@ -117,11 +117,22 @@ impl<'a, Sp, Sub, Q, R: Runtime> StridedTileSource<'a, Sp, Sub, Q, R> {
         self
     }
 
-    /// Force the overhang bounds-check on or off. Default: derived from the concrete space when
-    /// minted by a [`Launcher`](crate::Launcher) (checked exactly when a subspace axis
-    /// [`overhangs`](Space::overhangs)), else `true`.
+    /// Force the overhang bounds-check on or off (using [`Boundary::Zero`] when checked).
+    /// Default: derived from the concrete space when minted by a [`Launcher`](crate::Launcher)
+    /// (checked exactly when a subspace axis [`overhangs`](Space::overhangs)), else `Some(Boundary::Zero)`.
+    /// A boolean convenience over [`with_boundary`](Self::with_boundary): it unconditionally
+    /// overwrites whatever mode was set before it, so a `with_boundary(Some(Boundary::Clamp))`
+    /// before this call is silently dropped back to `Zero`. Sequence a `Clamp` override after
+    /// `checked`, not before it.
     pub fn checked(mut self, check: bool) -> Self {
-        self.data.check = Some(check);
+        self.data.boundary = Some(if check { Some(Boundary::Zero) } else { None });
+        self
+    }
+
+    /// Set the boundary handling mode for out-of-bounds access explicitly (`None` forces
+    /// unchecked, `Some` forces checked at that mode).
+    pub fn with_boundary(mut self, boundary: Option<Boundary>) -> Self {
+        self.data.boundary = Some(boundary);
         self
     }
 
@@ -291,7 +302,7 @@ impl<'a, Q, R: Runtime> StridedTileSource<'a, Set, Set, Q, R> {
             subspace,
             tiling,
             v,
-            check,
+            boundary,
             stage,
             units,
             quant,
@@ -331,18 +342,25 @@ impl<'a, Q, R: Runtime> StridedTileSource<'a, Set, Set, Q, R> {
         // Explicit override wins; a Launcher-minted source derives the check from overhang, and
         // the free-standing path stays conservatively checked. A dim whose axis is absent from the
         // space is a broadcast omission (it drops out below): nothing to overhang.
-        let check = check.unwrap_or_else(|| match concrete {
-            Some(concrete) => physical_axes
-                .iter()
-                .filter(|&&axis| concrete.contains(axis))
-                .any(|&axis| concrete.overhangs(axis)),
-            None => true,
+        let boundary = boundary.unwrap_or_else(|| match concrete {
+            Some(concrete) => {
+                let overhangs = physical_axes
+                    .iter()
+                    .filter(|&&axis| concrete.contains(axis))
+                    .any(|&axis| concrete.overhangs(axis));
+                if overhangs {
+                    Some(Boundary::Zero)
+                } else {
+                    None
+                }
+            }
+            None => Some(Boundary::Zero),
         });
 
         // A masked access counts its length in lines and would clip valid rows, so a
         // bounds-checked operand must stay scalar.
         assert!(
-            !(check && v > 1),
+            !(boundary.is_some() && v > 1),
             "StridedTileSource: a bounds-checked operand cannot be vectorized"
         );
 
@@ -365,7 +383,7 @@ impl<'a, Q, R: Runtime> StridedTileSource<'a, Set, Set, Q, R> {
         binding.shape = shape[..].into();
         binding.strides = strides[..].into();
         let mut spec =
-            TileSpec::from_concrete(&ConcreteLayout::new(&phys), check, units).leaf(leaf);
+            TileSpec::from_concrete(&ConcreteLayout::new(&phys), boundary, units).leaf(leaf);
         if let Some(stage) = stage {
             spec = spec.staged(stage);
         }

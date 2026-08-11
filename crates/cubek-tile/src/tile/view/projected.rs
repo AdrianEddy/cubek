@@ -84,8 +84,9 @@ impl<L: LogicalLayout> Layout for Projected<L> {
 
 /// A [`Layout`] mapping a tile's logical coordinate to its window's physical one:
 /// `phys[pa] = Σ logical[axis] * scale`. Sits between the [`Window`](crate::Window) and the
-/// element layout, so the window's `bound` still masks the read (an out-of-range stencil tap
-/// reads zero). Constant offsets are handled by [`Window`](crate::Window) and omitted here.
+/// element layout: this only folds axes, it never decides what an out-of-range tap does, so the
+/// window's own [`Boundary`](crate::Boundary) (zero or the edge cell) still governs the read.
+/// Constant offsets are handled by [`Window`](crate::Window) and omitted here.
 #[derive(CubeType, Clone)]
 #[expand(derive(Clone))]
 pub struct AxisProjection {
