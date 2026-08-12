@@ -4,6 +4,7 @@
 
 use cubecl::zspace::SmallVec;
 
+use super::gcd;
 use crate::{Axis, MAX_AXES, PhysicalAxisMap, Projection};
 
 /// The compacted stage of a [`Projection`]: per physical axis, how many cells the stage holds and
@@ -62,6 +63,14 @@ impl Compaction {
             !projection.has_dynamic_scales(),
             "Compaction: a Dynamic coefficient has no comptime window extent, so the operand \
              carrying it cannot be staged (use Schedule::Direct)"
+        );
+        // The lattice below is the one the numerator's coefficients generate. Dividing it does not
+        // yield a lattice: a rational axis advances by one physical cell on some steps and none on
+        // others, so its window has no single step to quotient by.
+        assert!(
+            !projection.is_rational(),
+            "Compaction: a rational axis's window is not a lattice, so it has no compacted step; \
+             the operand carrying it cannot be staged (use Schedule::Direct)"
         );
         let rank = projection.physical_rank();
         let mut steps = SmallVec::new();
@@ -163,10 +172,6 @@ impl Compaction {
     pub fn cells(&self, vector_size: usize) -> usize {
         self.line_extents(vector_size).iter().product()
     }
-}
-
-fn gcd(a: usize, b: usize) -> usize {
-    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 #[cfg(test)]
@@ -334,6 +339,21 @@ mod tests {
             &[OH, RH, CI],
             &[
                 PhysicalAxisMap::scaled(&[(OH, Scale::Dynamic), (RH, Scale::Static(1))]),
+                PhysicalAxisMap::of(CI),
+            ],
+        );
+        Compaction::of(&p, 4, extents(8, 3, 16));
+    }
+
+    /// A rational axis steps one physical cell on some outputs and none on others, so its window
+    /// has no lattice to quotient.
+    #[test]
+    #[should_panic(expected = "not a lattice")]
+    fn a_rational_axis_is_refused() {
+        let p = Projection::new(
+            &[OH, RH, CI],
+            &[
+                PhysicalAxisMap::affine(&[(OH, 2), (RH, 3)]).over(3),
                 PhysicalAxisMap::of(CI),
             ],
         );

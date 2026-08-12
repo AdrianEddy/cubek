@@ -109,14 +109,18 @@ impl<'a, Sp, Sub, Q, R: Runtime> StridedTileSource<'a, Sp, Sub, Q, R> {
     ///
     /// # Bounds Checking & Extents
     /// - Boundary checking is enabled by default if the projection [`may_underflow`](Projection::may_underflow)
-    ///   (override with [`checked`](Self::checked)).
+    ///   (override with [`checked`](Self::checked)). A window running off the buffer's *tail* is
+    ///   not detected: nothing here knows how far the receptive field reaches, only the tiling's
+    ///   own divisibility. A gather whose last window overruns the buffer, which a rational
+    ///   mapping's does by construction, must state [`checked(true)`](Self::checked) itself.
     /// - An axis sharing a physical dim with another has no extent of its own here (the buffer holds
     ///   the receptive field they reach over), so if it is [`Dynamic`](crate::Extent) some other
     ///   operand of the operation must state its size ([`Tile::witnesses`](crate::Tile::witnesses)).
     ///   Nothing here can see the other operands, so an axis no operand answers for is reported at
     ///   expansion, by the op that walks it.
-    /// - Dynamic scale and offset coefficients ([`Scale::Dynamic`](crate::Scale), [`Offset::Dynamic`](crate::Offset))
-    ///   are passed at runtime via [`TileArg::tile_gathered`](crate::TileArg::tile_gathered).
+    /// - Dynamic scales, divisors and offsets ([`Scale::Dynamic`](crate::Scale),
+    ///   [`Divisor::Dynamic`](crate::Divisor), [`Offset::Dynamic`](crate::Offset)) are passed at
+    ///   runtime via [`TileArg::tile_gathered`](crate::TileArg::tile_gathered).
     pub fn gathered(mut self, projection: Projection) -> StridedTileSource<'a, Sp, Set, Q, R> {
         self.data.projection = Some(projection);
         StridedTileSource {
@@ -398,6 +402,12 @@ impl<'a, Q, R: Runtime> StridedTileSource<'a, Set, Set, Q, R> {
             !spec.projection.has_dynamic_scales() || !space.partitioner().stages(),
             "StridedTileSource: a Dynamic coefficient cannot be staged, its window has no \
              comptime extent; the schedule must be Direct"
+        );
+        // Reported here rather than at `Compaction::of`, on the caller's thread.
+        assert!(
+            !spec.projection.is_rational() || !space.partitioner().stages(),
+            "StridedTileSource: a rational axis's window is not a lattice, so it has no compacted \
+             step; the schedule must be Direct"
         );
         Realized {
             tensor: binding.into_tensor_arg(),
