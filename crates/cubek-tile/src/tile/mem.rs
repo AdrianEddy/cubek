@@ -257,20 +257,6 @@ impl<T: Numeric> Tile<T> {
             "Tile::of: the projection has {} Dynamic offsets but {offsets_given} were given",
             coords.dynamic_offset_count()
         ));
-        // A staged operand's smem is allocated from its compacted window, whose extent a runtime
-        // coefficient makes runtime. `Compaction::of` refuses it too; this is the earlier, clearer
-        // report, at the operand rather than at the stage.
-        comptime!(assert!(
-            !coords.has_dynamic_scales() || !space.partitioner().stages(),
-            "Tile::of: a Dynamic coefficient cannot be staged, its window has no comptime extent; \
-             the schedule must be Direct"
-        ));
-        // Subsumes a Dynamic divisor, which is rational by construction.
-        comptime!(assert!(
-            !coords.is_rational() || !space.partitioner().stages(),
-            "Tile::of: a rational axis's window is not a lattice, so it has no compacted step; \
-             the schedule must be Direct"
-        ));
         // Stage layout: the explicit override, else derived from the operand's leaf.
         let stage = comptime!(StagePlan {
             layout: spec.stage.unwrap_or_else(|| StageStorage::for_leaf(leaf)),
@@ -384,6 +370,15 @@ impl<T: Numeric> Tile<T> {
     }
 }
 
+/// Comptime metadata bundled when constructing a shared-memory stage.
+#[derive(Clone)]
+pub(crate) struct StageMeta {
+    pub space: Space,
+    pub leaf: Leaf,
+    pub vector_size: usize,
+    pub stage: StagePlan,
+}
+
 #[cube]
 impl<T: Numeric> MemData<T> {
     /// Allocate a fresh shared-memory tile shaped to stage one `divide()` sub-tile of `operand`, in
@@ -404,7 +399,14 @@ impl<T: Numeric> MemData<T> {
                 if comptime!(projection.is_direct()) {
                     MemData::smem(space, leaf, vector_size, stage)
                 } else {
-                    MemData::smem_gathered(space, leaf, vector_size, stage, projection)
+                    MemData::smem_gathered(
+                        space,
+                        leaf,
+                        vector_size,
+                        stage,
+                        projection,
+                        &operand.runtime_map(),
+                    )
                 }
             }
             DequantAt::Read => MemData::smem_stored(operand),
@@ -478,7 +480,14 @@ impl<T: Numeric> MemData<T> {
         #[comptime] stage: StagePlan,
     ) -> Tile<T> {
         let form = comptime!(StageForm::dense(&space, vector_size, stage.layout));
-        MemData::smem_with_form(space, leaf, vector_size, stage, form)
+        let map = RuntimeMap::integral(comptime!(form.projection.physical_rank()));
+        let meta = comptime!(StageMeta {
+            space,
+            leaf,
+            vector_size,
+            stage,
+        });
+        MemData::smem_with_form(meta, form, map)
     }
 
     /// [`smem`](MemData::smem) for a *gathered* operand: the stage holds the physical window its
@@ -496,6 +505,7 @@ impl<T: Numeric> MemData<T> {
         #[comptime] vector_size: usize,
         #[comptime] stage: StagePlan,
         #[comptime] projection: Projection,
+        map: &RuntimeMap,
     ) -> Tile<T> {
         let form = comptime!(StageForm::gathered(
             &space,
@@ -503,28 +513,34 @@ impl<T: Numeric> MemData<T> {
             stage.layout,
             &projection
         ));
-        MemData::smem_with_form(space, leaf, vector_size, stage, form)
-    }
-
-    /// The body every smem constructor shares, taking the buffer's [`StageForm`] directly.
-    fn smem_with_form(
-        #[comptime] space: Space,
-        #[comptime] leaf: Leaf,
-        #[comptime] vector_size: usize,
-        #[comptime] stage: StagePlan,
-        #[comptime] form: StageForm,
-    ) -> Tile<T> {
-        let size!(W) = vector_size;
-        let smem = Shared::<[Vector<T, W>]>::new_slice(comptime!(form.cells()));
-        MemData::smem_over(
+        let stage_map = RuntimeMap {
+            coefficients: map.coefficients.clone(),
+            residues: const_coords(comptime!(vec![0; form.projection.physical_rank()])),
+        };
+        let stage_map =
+            if comptime!(form.projection.is_rational() || form.projection.has_dynamic_scales()) {
+                stage_map.stored()
+            } else {
+                stage_map
+            };
+        let meta = comptime!(StageMeta {
             space,
             leaf,
             vector_size,
             stage,
-            &smem,
-            ComptimeOption::new_None(),
-            form,
-        )
+        });
+        MemData::smem_with_form(meta, form, stage_map)
+    }
+
+    /// The body every smem constructor shares, taking the buffer's [`StageForm`] directly.
+    fn smem_with_form(
+        #[comptime] meta: StageMeta,
+        #[comptime] form: StageForm,
+        map: RuntimeMap,
+    ) -> Tile<T> {
+        let size!(W) = meta.vector_size;
+        let smem = Shared::<[Vector<T, W>]>::new_slice(comptime!(form.cells()));
+        MemData::smem_over(meta, &smem, ComptimeOption::new_None(), form, map)
     }
 
     /// [`smem`](MemData::smem) staging the element an operand is *stored* in rather than the one it
@@ -546,7 +562,14 @@ impl<T: Numeric> MemData<T> {
         let size!(WP) = comptime!(vector_size / scheme.num_quants());
         let smem = Shared::<[Vector<I, WP>]>::new_slice(comptime!(form.cells()));
         let quant = smem_quant_info(comptime!(space.clone()), comptime!(scheme));
-        MemData::smem_over(space, leaf, vector_size, stage, &smem, quant, form)
+        let map = RuntimeMap::integral(comptime!(form.projection.physical_rank()));
+        let meta = comptime!(StageMeta {
+            space,
+            leaf,
+            vector_size,
+            stage,
+        });
+        MemData::smem_over(meta, &smem, quant, form, map)
     }
 
     /// The body every smem constructor shares: everything but the allocation's element (which is why
@@ -554,13 +577,11 @@ impl<T: Numeric> MemData<T> {
     /// erases the slice to the served `T` (the views recover the stored element through
     /// [`lines_storage`](MemData::lines_storage)) and wraps it in the whole-buffer window.
     fn smem_over<S: CubePrimitive>(
-        #[comptime] space: Space,
-        #[comptime] leaf: Leaf,
-        #[comptime] vector_size: usize,
-        #[comptime] stage: StagePlan,
+        #[comptime] meta: StageMeta,
         smem: &Shared<[S]>,
         quant: ComptimeOption<QuantInfo>,
         #[comptime] form: StageForm,
+        map: RuntimeMap,
     ) -> Tile<T> {
         let buffer = unsafe {
             smem.inner_ref()
@@ -571,17 +592,12 @@ impl<T: Numeric> MemData<T> {
         let (origin, extent) = full_window(comptime!(form.clone()));
         // Smem never overhangs its own buffer, so the bound is the extent and checks are off.
         let bound = extent.clone();
-        // A stage's own mapping is the compacted one, which is always integral: a Dynamic
-        // coefficient never reaches a stage and neither does a rational axis (`Compaction::of`
-        // refuses both), and the compaction drops the offset, the gmem window having already been
-        // placed, so there is no phase to carry either.
-        let map = RuntimeMap::integral(comptime!(form.projection.physical_rank()));
         let gmem_projection = comptime!(form.positional.clone());
         Tile::<T> {
             tile_kind: TileKind::new_Smem(MemData::<T> {
                 store: Store::<T> {
                     buffer,
-                    vector_size,
+                    vector_size: meta.vector_size,
                     quant,
                 },
                 layout: GmemLayout {
@@ -599,12 +615,12 @@ impl<T: Numeric> MemData<T> {
                 access: comptime!(Access {
                     whole: true,
                     overhang: Overhang::Never,
-                    stage,
+                    stage: meta.stage,
                 }),
                 lane_share: comptime!(LaneShare::Whole),
             }),
-            space: comptime!(space),
-            leaf: comptime!(leaf),
+            space: comptime!(meta.space),
+            leaf: comptime!(meta.leaf),
         }
     }
 }
@@ -772,6 +788,12 @@ impl<T: Numeric> MemData<T> {
         src: &MemData<T>,
         #[comptime] space: Space,
     ) {
+        // A gathered stage owns mutable map registers alongside its bytes. Store the source
+        // window's coefficients and phase into those registers so bytes and interpretation are
+        // one slot value. Direct stages carry no runtime map state.
+        if comptime!(self.projection.is_rational() || self.projection.has_dynamic_scales()) {
+            self.map.store_from(&src.map);
+        }
         let check = comptime!(src.access.overhang.masks());
         let w = comptime!(self.store.vector_size);
         let compaction = comptime!(stage_compaction(
@@ -1595,8 +1617,12 @@ fn gathered_origin(
         if comptime!(!axis_map.is_rational()) {
             (offset, 0u32)
         } else {
-            let divisor =
-                divisor_of(comptime!(projection.clone()), coefficients, pa).fcast::<i32>();
+            let divisor = match comptime!(axis_map.divisor()) {
+                Divisor::Static(d) => comptime!(d as i32).runtime(),
+                Divisor::Dynamic { .. } => coefficients
+                    .at(comptime!(projection.dynamic_divisor_index(pa).unwrap()))
+                    .fcast::<i32>(),
+            };
             let start = floor_div(offset, divisor);
             (start, offset.fsub(start.fmul(divisor)).fcast::<u32>())
         }
@@ -1652,7 +1678,7 @@ fn gathered_descent(
             // The line division above never meets a runtime coefficient: the innermost physical
             // axis is a single identity term, which `Projection::validate` requires and `Static`
             // is the only spelling of.
-            Scale::Dynamic => {
+            Scale::Dynamic { .. } => {
                 let coefficient = map
                     .coefficients
                     .at(comptime!(projection.dynamic_scale_index(pa, t).unwrap()));
@@ -1686,15 +1712,30 @@ fn gathered_descent(
         // No `/ vector_size` anywhere below, and none is owed: `Projection::validate` refuses a
         // rational innermost physical axis at any width past `1`, so it is `1` whenever this
         // branch runs and the terms above are already in elements.
-        let divisor = divisor_of(comptime!(projection.clone()), &map.coefficients, pa);
         let numerator = advance.fadd(map.residues.at(pa));
-        let residue = numerator.frem(divisor);
         let field = spans.fsum(comptime!(picks.clone()));
-        (
-            numerator.fdiv(divisor),
-            residue,
-            field.fadd(residue).fdiv(divisor).fadd(1),
-        )
+        match comptime!(axis_map.divisor()) {
+            Divisor::Static(d) => {
+                let d = comptime!(d as u32);
+                let residue = numerator.frem(d);
+                (
+                    numerator.fdiv(d),
+                    residue,
+                    field.fadd(residue).fdiv(d).fadd(1),
+                )
+            }
+            Divisor::Dynamic { .. } => {
+                let d = map
+                    .coefficients
+                    .at(comptime!(projection.dynamic_divisor_index(pa).unwrap()));
+                let residue = numerator.frem(d);
+                (
+                    numerator.fdiv(d),
+                    residue,
+                    field.fadd(residue).fdiv(d).fadd(1),
+                )
+            }
+        }
     }
 }
 

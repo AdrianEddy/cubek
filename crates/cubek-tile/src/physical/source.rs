@@ -120,7 +120,9 @@ impl<'a, Sp, Sub, Q, R: Runtime> StridedTileSource<'a, Sp, Sub, Q, R> {
     ///   expansion, by the op that walks it.
     /// - Dynamic scales, divisors and offsets ([`Scale::Dynamic`](crate::Scale),
     ///   [`Divisor::Dynamic`](crate::Divisor), [`Offset::Dynamic`](crate::Offset)) are passed at
-    ///   runtime via [`TileArg::tile_gathered`](crate::TileArg::tile_gathered).
+    ///   runtime via [`TileArg::tile_gathered`](crate::TileArg::tile_gathered). A scale or divisor
+    ///   declares a bound beside its runtime value, so the window it spans still has a comptime
+    ///   size and the operand stages like any other; the launch must then stay within that bound.
     pub fn gathered(mut self, projection: Projection) -> StridedTileSource<'a, Sp, Set, Q, R> {
         self.data.projection = Some(projection);
         StridedTileSource {
@@ -397,18 +399,6 @@ impl<'a, Q, R: Runtime> StridedTileSource<'a, Set, Set, Q, R> {
             );
             quant.validate(&space.project(spec.axes()), v, leaf);
         }
-        // Dynamic projection scales cannot be staged to shared memory (requires compile-time extent).
-        assert!(
-            !spec.projection.has_dynamic_scales() || !space.partitioner().stages(),
-            "StridedTileSource: a Dynamic coefficient cannot be staged, its window has no \
-             comptime extent; the schedule must be Direct"
-        );
-        // Reported here rather than at `Compaction::of`, on the caller's thread.
-        assert!(
-            !spec.projection.is_rational() || !space.partitioner().stages(),
-            "StridedTileSource: a rational axis's window is not a lattice, so it has no compacted \
-             step; the schedule must be Direct"
-        );
         Realized {
             tensor: binding.into_tensor_arg(),
             vector_size: v,

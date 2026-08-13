@@ -7,9 +7,7 @@
 use cubecl::prelude::*;
 use cubecl::std::tensor::layout::CoordsDyn;
 
-use crate::{
-    Axis, Coords, Divisor, Fold, FoldExpand, FoldSeq, FoldSeqExpand, Projection, const_coords,
-};
+use crate::{Axis, Coords, Fold, FoldExpand, FoldSeq, FoldSeqExpand, Projection, const_coords};
 
 /// What a [`Projection`] cannot state at comptime: the values its [`Dynamic`](crate::Scale)
 /// coefficients and divisors carry, and the phase its window origin sits at under a
@@ -45,6 +43,22 @@ impl RuntimeMap {
             residues: const_coords(comptime!(vec![0; physical_rank])),
         }
     }
+
+    /// Materialize this map in mutable, per-slot kernel registers. A normal clone preserves the
+    /// source expressions; a staged slot instead needs values that survive independently while a
+    /// sibling slot is refilled for another region.
+    pub(crate) fn stored(&self) -> RuntimeMap {
+        RuntimeMap {
+            coefficients: self.coefficients.stored(),
+            residues: self.residues.stored(),
+        }
+    }
+
+    /// Store a source window's complete runtime addressing state in this slot.
+    pub(crate) fn store_from(&mut self, src: &RuntimeMap) {
+        self.coefficients.store_from(&src.coefficients);
+        self.residues.store_from(&src.residues);
+    }
 }
 
 /// The logical extent per axis, folded from `projection`'s physical shape: a single-carrier axis
@@ -65,23 +79,6 @@ pub fn logical_extent(
         bound.push(physical_shape.fproduct(picks));
     }
     bound
-}
-
-/// Physical axis `pa`'s [`Divisor`] as a kernel value: the comptime constant, or the entry the
-/// coefficient carrier holds for it. `1` for every integer mapping, which [`Fold`] then passes
-/// through, so the rational paths cost nothing where they are not used.
-#[cube]
-pub(crate) fn divisor_of(
-    #[comptime] projection: Projection,
-    coefficients: &Coords<u32>,
-    #[comptime] pa: usize,
-) -> u32 {
-    match comptime!(projection.divisor(pa)) {
-        Divisor::Static(d) => comptime!(d as u32).runtime(),
-        Divisor::Dynamic => {
-            coefficients.at(comptime!(projection.dynamic_divisor_index(pa).unwrap()))
-        }
-    }
 }
 
 /// The line offset one `edge`-sized tile step along `axis` moves under `projection`: `axis`'s

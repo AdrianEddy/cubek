@@ -169,9 +169,9 @@ impl Layout for AxisProjection {
                 let p = comptime!(self.space.position(term.axis));
                 match comptime!(term.scale) {
                     Scale::Static(s) => terms.push(pos[p].fmul(comptime!(s as u32))),
-                    Scale::Dynamic => terms.push(pos[p].fmul(self.map.coefficients.at(comptime!(
-                        self.projection.dynamic_scale_index(pa, t).unwrap()
-                    )))),
+                    Scale::Dynamic { .. } => terms.push(pos[p].fmul(self.map.coefficients.at(
+                        comptime!(self.projection.dynamic_scale_index(pa, t).unwrap()),
+                    ))),
                 }
             }
             let sum = terms.fsum(comptime!(
@@ -179,12 +179,15 @@ impl Layout for AxisProjection {
             ));
 
             if comptime!(axis_map.is_rational()) {
-                let divisor = divisor_of(
-                    comptime!(self.projection.clone()),
-                    &self.map.coefficients,
-                    pa,
-                );
-                out.push(sum.fdiv(divisor));
+                match comptime!(axis_map.divisor()) {
+                    Divisor::Static(d) => out.push(sum.fdiv(comptime!(d as u32))),
+                    Divisor::Dynamic { .. } => {
+                        let divisor = self.map.coefficients.at(comptime!(
+                            self.projection.dynamic_divisor_index(pa).unwrap()
+                        ));
+                        out.push(sum.fdiv(divisor));
+                    }
+                }
             } else {
                 out.push(sum);
             }
