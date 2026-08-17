@@ -912,11 +912,17 @@ impl<T: Numeric> MemData<T> {
     /// Zero this window: whole lines at the store's width; a checked window skips
     /// cells past the logical bound.
     pub(crate) fn zero(&mut self) {
+        self.init(T::from_int(0));
+    }
+
+    /// Initialize this window with `val`: whole lines at the store's width; a checked window
+    /// skips cells past the logical bound.
+    pub(crate) fn init(&mut self, val: T) {
         let size!(W) = comptime!(self.store.vector_size);
         let mut d = self.flat_mut::<W>();
         let total = d.shape();
         for i in 0..total {
-            d.write(i, Vector::<T, W>::cast_from(T::from_int(0)));
+            d.write(i, Vector::<T, W>::cast_from(val));
         }
     }
 
@@ -1373,6 +1379,24 @@ impl<T: Numeric> MemData<T> {
     ) -> AccumulateView<'_, T, W> {
         let lane_share = comptime!(self.lane_share);
         AccumulateView::new(self.matrix_mut::<W>(i, space), lane_share)
+    }
+
+    /// The [`AccumulateView`] over flat elements: [`flat_mut`](MemData::flat_mut) plus the
+    /// [`LaneShare`] these cells carry.
+    pub(crate) fn flat_accumulate<W: Size>(&mut self) -> AccumulateView<'_, T, W, Coords1d> {
+        // A flat logical scan only agrees with this physical window under the direct,
+        // non-storage-tiled mapping. Otherwise the reduction's logical accumulator index would
+        // seed and commit a different physical cell than the one it reduces for.
+        comptime!(assert!(
+            !self.layout.projection.is_tiled(),
+            "MemData::flat_accumulate: a storage-tiled window has no flat logical accumulator view"
+        ));
+        comptime!(assert!(
+            self.projection.is_direct(),
+            "MemData::flat_accumulate: a gathered window has no flat logical accumulator view"
+        ));
+        let lane_share = comptime!(self.lane_share);
+        AccumulateView::new(self.flat_mut::<W>(), lane_share)
     }
 
     /// Window down to `region`: shift the origin by the region's tile coordinate times the
