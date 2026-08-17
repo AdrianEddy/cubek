@@ -11,6 +11,32 @@ use cubecl::unexpanded;
 
 use crate::*;
 
+/// The one resolved staging policy shared by unary and binary slots. Backing allocation,
+/// rendezvous, and producer-arrival count are derived together from the actual sources.
+#[derive(Clone, Copy)]
+struct SlotPlan {
+    stage: OperandStage,
+    sync: Sync,
+    collective_full: bool,
+}
+
+fn slot_plan(requested: OperandStage, deliveries: &[Delivery]) -> SlotPlan {
+    let stage = if deliveries.contains(&Delivery::Procedural) {
+        OperandStage::Smem
+    } else {
+        requested
+    };
+    let sync = match stage {
+        OperandStage::Plane => Sync::Solo,
+        OperandStage::Smem => Sync::for_deliveries(deliveries),
+    };
+    SlotPlan {
+        stage,
+        sync,
+        collective_full: Sync::collective_full(deliveries),
+    }
+}
+
 #[cube]
 impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
     /// Build a slot staging one region of the operands `lhs`/`rhs`. An [`OperandStage::Plane`]
@@ -34,16 +60,20 @@ impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
         let pin_rhs = comptime!(split && op_space.walk_invariant(&rhs.space));
         // Both operands use the output leaf's staging kind. The helper preserves each tile's
         // own projection and rejects unsupported Plane/TMA/gather combinations.
-        let stage = comptime!(out.operand_stage(lhs.leaf));
+        let requested_stage = comptime!(out.operand_stage(lhs.leaf));
+        let plan = comptime!(slot_plan(requested_stage, &[lhs_delivery, rhs_delivery]));
+        let stage = comptime!(plan.stage);
         let stages = (
             stage_operand(lhs, comptime!(out.clone()), stage),
             stage_operand(rhs, comptime!(out.clone()), stage),
         );
-        let sync = match comptime!(stage) {
-            OperandStage::Plane => comptime!(Sync::Solo),
-            OperandStage::Smem => comptime!(Sync::merge(lhs_delivery, rhs_delivery)),
-        };
-        Staging::wrap(stages, Pipeline::new(sync), pin_lhs, pin_rhs, stage)
+        Staging::wrap(
+            stages,
+            Pipeline::new(comptime!(plan.sync), comptime!(plan.collective_full)),
+            pin_lhs,
+            pin_rhs,
+            stage,
+        )
     }
 
     /// Fill the pinned operand(s), those the walk leaves invariant, from `region`'s window.
@@ -147,13 +177,17 @@ impl<T: Numeric> Staging<Tile<T>> {
         // can't decide invariance at comptime. Both fall back to streaming (pin = false).
         let split = comptime!(op_space.is_static() && !delivery.is_tma());
         let pin = comptime!(split && op_space.walk_invariant(&input.space));
-        let stage = comptime!(out.operand_stage(input.leaf));
+        let requested_stage = comptime!(out.operand_stage(input.leaf));
+        let plan = comptime!(slot_plan(requested_stage, &[delivery]));
+        let stage = comptime!(plan.stage);
         let staged_input = stage_operand(input, comptime!(out.clone()), stage);
-        let sync = match comptime!(stage) {
-            OperandStage::Plane => comptime!(Sync::Solo),
-            OperandStage::Smem => comptime!(Sync::from(delivery)),
-        };
-        Staging::wrap(staged_input, Pipeline::new(sync), pin, false, stage)
+        Staging::wrap(
+            staged_input,
+            Pipeline::new(comptime!(plan.sync), comptime!(plan.collective_full)),
+            pin,
+            false,
+            stage,
+        )
     }
 
     /// Fill the pinned operand from `region`'s window.
@@ -261,5 +295,18 @@ fn stage_operand<T: Numeric>(
             )
         }
         OperandStage::Smem => MemData::smem_like(input),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn procedural_upgrades_a_plane_request_to_smem() {
+        assert_eq!(
+            slot_plan(OperandStage::Plane, &[Delivery::Procedural, Delivery::Copy]).stage,
+            OperandStage::Smem,
+        );
     }
 }

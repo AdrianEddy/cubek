@@ -22,25 +22,31 @@ pub enum Sync {
     Barrier,
 }
 
-/// Deduce the strategy from the operand's [`Delivery`]: async (TMA) → `Barrier`,
-/// strided → `Cube`.
-impl From<Delivery> for Sync {
-    fn from(delivery: Delivery) -> Sync {
-        match delivery {
-            Delivery::Strided => Sync::Cube,
-            Delivery::Tma => Sync::Barrier,
-        }
-    }
-}
-
 impl Sync {
-    /// The strategy two operands share. A mix is rejected.
-    pub fn merge(lhs: Delivery, rhs: Delivery) -> Sync {
-        assert_eq!(
-            lhs, rhs,
-            "Staging: mixed delivery; all operands must be TMA sources or none"
+    /// Join the rendezvous requirements of a slot's sources. `Barrier` dominates `Cube` because
+    /// TMA transaction completion must be included in the slot's publication.
+    pub fn for_deliveries(deliveries: &[Delivery]) -> Sync {
+        assert!(
+            !deliveries.is_empty(),
+            "Staging: a slot must have at least one delivery"
         );
-        Sync::from(lhs)
+        deliveries.iter().fold(Sync::Cube, |sync, delivery| {
+            match (sync, delivery.rendezvous()) {
+                (Sync::Barrier, _) | (_, Sync::Barrier) => Sync::Barrier,
+                (Sync::Cube, Sync::Cube) => Sync::Cube,
+                (Sync::Solo, _) | (_, Sync::Solo) => {
+                    unreachable!("source rendezvous is never Solo")
+                }
+            }
+        })
+    }
+
+    /// Whether a barrier slot needs every unit to publish its writes. Pure TMA has one hardware
+    /// issuer; a mixed slot also contains a synchronous cooperative fill.
+    pub fn collective_full(deliveries: &[Delivery]) -> bool {
+        deliveries
+            .iter()
+            .any(|delivery| delivery.rendezvous() == Sync::Cube)
     }
 }
 
@@ -59,10 +65,15 @@ pub enum Pipeline {
     /// parity, so the fill overlaps compute. TMA motivates it, but the barrier itself is
     /// delivery-agnostic; see [`Pipeline::fill`].
     Barrier {
-        /// Producer→consumer (one producer arrival): flips once the fill's transaction bytes land.
+        /// Producer→consumer: flips after every unit arrives and all declared TMA transaction
+        /// bytes land.
         full: Shared<Barrier>,
         /// Consumer→producer (one arrival per unit): flips once every unit has read and freed the slot.
         empty: Shared<Barrier>,
+        /// A mixed TMA/synchronous slot needs every producer to publish; a pure TMA slot is
+        /// published by its elected issuer alone.
+        #[cube(comptime)]
+        collective_full: bool,
         /// mbarrier parity for `wait_parity`; flipped once per read.
         phase: u32,
     },
@@ -72,17 +83,19 @@ pub enum Pipeline {
 impl Pipeline {
     /// Allocate the pipeline for `sync`: the `full`/`empty` mbarrier pair, sealed by a proxy fence
     /// before any bulk copy, for [`Barrier`](Sync::Barrier); nothing to allocate otherwise.
-    pub(crate) fn new(#[comptime] sync: Sync) -> Pipeline {
+    pub(crate) fn new(#[comptime] sync: Sync, #[comptime] collective_full: bool) -> Pipeline {
         match sync {
             Sync::Solo => Pipeline::new_Solo(),
             Sync::Cube => Pipeline::new_Cube(),
             Sync::Barrier => {
-                // full: one producer arrival; empty: one arrival per unit.
-                let full = Barrier::shared(1, UNIT_POS == 0);
+                // A mixed slot collects cooperative writers and TMA bytes; pure TMA keeps its
+                // one elected producer arrival.
+                let full_arrivals = comptime!(if collective_full { CUBE_DIM } else { 1u32 });
+                let full = Barrier::shared(full_arrivals, UNIT_POS == 0);
                 let empty = Barrier::shared(CUBE_DIM, UNIT_POS == 0);
                 sync_async_proxy_shared();
                 sync_cube();
-                Pipeline::new_Barrier(full, empty, 0)
+                Pipeline::new_Barrier(full, empty, collective_full, 0)
             }
         }
     }
@@ -104,9 +117,40 @@ impl Pipeline {
                 }
                 // A strided source under a barrier is a plain synchronous copy.
                 (TileKind::Smem(d), TileKind::Gmem(s) | TileKind::Smem(s)) => d.fill_from(s, space),
+                (TileKind::Smem(d), TileKind::Procedural(s)) => d.fill_procedural(s, space),
                 _ => panic!("Pipeline::fill: unsupported kind pairing"),
             },
             Pipeline::Cube | Pipeline::Solo => dst.copy_from(src),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn procedural_and_strided_share_a_cube_pipeline() {
+        assert_eq!(
+            Sync::for_deliveries(&[Delivery::Procedural, Delivery::Copy]),
+            Sync::Cube
+        );
+    }
+
+    #[test]
+    fn procedural_and_tma_share_a_barrier_pipeline() {
+        assert_eq!(
+            Sync::for_deliveries(&[Delivery::Procedural, Delivery::Tma]),
+            Sync::Barrier
+        );
+        assert!(Sync::collective_full(&[
+            Delivery::Procedural,
+            Delivery::Tma
+        ]));
+    }
+
+    #[test]
+    fn pure_tma_keeps_its_single_producer_arrival() {
+        assert!(!Sync::collective_full(&[Delivery::Tma]));
     }
 }
