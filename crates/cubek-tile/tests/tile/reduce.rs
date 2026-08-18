@@ -79,6 +79,39 @@ fn reduce_kernel_v4<E: Numeric>(
     reduce_body(&input, &mut output, op);
 }
 
+/// Reduce an axis-index recipe so a trailing partial tile must be masked without a backing window.
+#[cube(launch)]
+fn procedural_reduce_kernel<E: Float>(
+    output: &TileArg<'_, E, Const<1>>,
+    #[comptime] space: Space,
+    #[define(E)] _dtype: ElemType,
+) {
+    let input = Tile::<E>::procedural(
+        comptime!(space.clone()),
+        comptime!(ProceduralRecipe::axis_index(K)),
+    );
+    let mut output = output.tile(space);
+    reduce_body(&input, &mut output, comptime!(ReduceLeafKind::Max));
+}
+
+/// The shared-memory variant must retain the procedural source's partial-tile mask while it
+/// materializes the recipe, rather than folding values from the padded overhang.
+#[cube(launch)]
+fn staged_procedural_reduce_kernel<E: Float>(
+    output: &TileArg<'_, E, Const<1>>,
+    #[comptime] space: Space,
+    #[define(E)] _dtype: ElemType,
+) {
+    let stage = comptime!(StagePlan::new(&[Residence::Smem], StageStorage::Strided, 0));
+    let input = Tile::<E>::procedural_resident(
+        comptime!(space.clone()),
+        comptime!(ProceduralRecipe::axis_index(K)),
+        stage,
+    );
+    let mut output = output.tile(space);
+    reduce_body(&input, &mut output, comptime!(ReduceLeafKind::Max));
+}
+
 /// Small integers, so every product and partial sum is exact in `f32` and the two kernels can be
 /// compared for equality rather than closeness.
 fn ramp(n: usize, period: usize) -> Vec<f32> {
@@ -142,7 +175,7 @@ fn run(
 fn plain(m: usize, n: usize, k: usize, tm: usize, tn: usize) -> HostData {
     let space = Tiling::new()
         .extents(&[(M, m), (N, n), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm))
                 .axis(N, Cut::sequential(tn))
                 .axis(K, Cut::sequential(k))
@@ -163,7 +196,7 @@ fn plain(m: usize, n: usize, k: usize, tm: usize, tn: usize) -> HostData {
 fn plain_batched(b: usize, m: usize, n: usize, k: usize, tm: usize, tn: usize) -> HostData {
     let space = Tiling::new()
         .extents(&[(B, b), (M, m), (N, n), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(B, Cut::sequential(1))
                 .axis(M, Cut::sequential(tm))
                 .axis(N, Cut::sequential(tn))
@@ -206,7 +239,7 @@ fn split_k_whole_reduce_at_leaf() {
 
     let space = Tiling::new()
         .extents(&[(M, m), (N, n), (K1, k1), (K2, k2)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm))
                 .axis(N, Cut::sequential(tn))
                 .axis(K1, Cut::sequential(k1))
@@ -235,7 +268,7 @@ fn split_k_major_half_walked() {
 
     let space = Tiling::new()
         .extents(&[(M, m), (N, n), (K1, k1), (K2, k2)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm))
                 .axis(N, Cut::sequential(tn))
                 .axis(K1, Cut::sequential(1))
@@ -264,7 +297,7 @@ fn split_k_with_a_batch_axis() {
 
     let space = Tiling::new()
         .extents(&[(B, b), (M, m), (N, n), (K1, k1), (K2, k2)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(B, Cut::sequential(1))
                 .axis(M, Cut::sequential(tm))
                 .axis(N, Cut::sequential(tn))
@@ -293,13 +326,36 @@ fn run_reduce(
     space: Space,
     op: ReduceLeafKind,
 ) -> HostData {
-    run_reduce_with_vw(in_shape, out_shape, in_axes, out_axes, space, op, 1)
+    run_reduce_with_vw(in_shape, out_shape, in_axes, out_axes, space, op, 1, &[])
+}
+
+/// [`run_reduce`] with the input's per-level [`Residence`] stated, for the walks that stage it.
+#[allow(clippy::too_many_arguments)]
+fn run_reduce_resident(
+    in_shape: Shape,
+    out_shape: Shape,
+    in_axes: &[Axis],
+    out_axes: &[Axis],
+    space: Space,
+    op: ReduceLeafKind,
+    in_residence: &[Residence],
+) -> HostData {
+    run_reduce_with_vw(
+        in_shape,
+        out_shape,
+        in_axes,
+        out_axes,
+        space,
+        op,
+        1,
+        in_residence,
+    )
 }
 
 /// Exercise a 2-D `M × K -> M` reduction and derive the reference fold from `op`, so schedule
 /// coverage does not duplicate the three identities and comparison loops.
 fn check_2d_reduce(
-    schedule: Schedule,
+    buffering: Buffering,
     m: usize,
     k: usize,
     tm: usize,
@@ -308,11 +364,20 @@ fn check_2d_reduce(
 ) {
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, schedule, |l| {
+        .level(WalkOrder::RowMajor, buffering, |l| {
             l.axis(M, Cut::sequential(tm)).axis(K, Cut::sequential(tk))
         })
         .build();
-    let got = run_reduce(shape![m, k], shape![m], &[M, K], &[M], space, op);
+    // Every caller of this helper stages: the level is what the buffering coverage exercises.
+    let got = run_reduce_resident(
+        shape![m, k],
+        shape![m],
+        &[M, K],
+        &[M],
+        space,
+        op,
+        &[Residence::Smem],
+    );
 
     for i in 0..m {
         let values = (0..k).map(|j| ((i * k + j) % 7) as f32);
@@ -324,11 +389,12 @@ fn check_2d_reduce(
         assert_eq!(
             got.get_f32(&[i]),
             want,
-            "{schedule:?} {op:?} mismatch at index {i}"
+            "{buffering:?} {op:?} mismatch at index {i}"
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_reduce_with_vw(
     in_shape: Shape,
     out_shape: Shape,
@@ -337,6 +403,7 @@ fn run_reduce_with_vw(
     space: Space,
     op: ReduceLeafKind,
     in_vw: usize,
+    in_residence: &[Residence],
 ) -> HostData {
     let client = <TestRuntime as Runtime>::client(&Default::default());
     let f32_ty = f32::elem_type_native();
@@ -360,7 +427,10 @@ fn run_reduce_with_vw(
                 &client,
                 space.cube_count(),
                 space.cube_dim(&client),
-                TileArgLaunch::new(in_binding.into_tensor_arg(), TileSpec::direct(in_axes)),
+                TileArgLaunch::new(
+                    in_binding.into_tensor_arg(),
+                    TileSpec::direct(in_axes).residence(in_residence),
+                ),
                 TileArgLaunch::new(out_binding.into_tensor_arg(), TileSpec::direct(out_axes)),
                 space,
                 op,
@@ -372,7 +442,10 @@ fn run_reduce_with_vw(
                 &client,
                 space.cube_count(),
                 space.cube_dim(&client),
-                TileArgLaunch::new(in_binding.into_tensor_arg(), TileSpec::direct(in_axes)),
+                TileArgLaunch::new(
+                    in_binding.into_tensor_arg(),
+                    TileSpec::direct(in_axes).residence(in_residence),
+                ),
                 TileArgLaunch::new(out_binding.into_tensor_arg(), TileSpec::direct(out_axes)),
                 space,
                 op,
@@ -390,7 +463,7 @@ fn test_reduce_axis_sum_2d_to_1d() {
     let (m, k, tm, tk) = (8, 16, 4, 16);
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm)).axis(K, Cut::sequential(tk))
         })
         .build();
@@ -415,7 +488,7 @@ fn test_reduce_axis_sum_walked_levels() {
     let (m, k, tm, tk) = (8, 16, 4, 4);
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm)).axis(K, Cut::sequential(tk))
         })
         .build();
@@ -440,7 +513,7 @@ fn test_reduce_axis_max_2d_to_1d() {
     let (m, k, tm, tk) = (8, 16, 4, 16);
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm)).axis(K, Cut::sequential(tk))
         })
         .build();
@@ -467,7 +540,7 @@ fn test_reduce_axis_min_2d_to_1d() {
     let (m, k, tm, tk) = (8, 16, 4, 16);
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm)).axis(K, Cut::sequential(tk))
         })
         .build();
@@ -494,7 +567,7 @@ fn test_reduce_axis_multi_axis_3d_to_1d() {
     let (b, m, k) = (3, 4, 8);
     let space = Tiling::new()
         .extents(&[(B, b), (M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(B, Cut::sequential(1))
                 .axis(M, Cut::sequential(2))
                 .axis(K, Cut::sequential(4))
@@ -524,32 +597,32 @@ fn test_reduce_axis_multi_axis_3d_to_1d() {
 
 #[test]
 fn test_reduce_axis_sum_staged() {
-    check_2d_reduce(Schedule::Staged, 8, 16, 4, 8, ReduceLeafKind::Sum);
+    check_2d_reduce(Buffering::SINGLE, 8, 16, 4, 8, ReduceLeafKind::Sum);
 }
 
 #[test]
 fn test_reduce_axis_sum_double_buffered() {
-    check_2d_reduce(Schedule::DoubleBuffered, 8, 16, 4, 4, ReduceLeafKind::Sum);
+    check_2d_reduce(Buffering::DOUBLE, 8, 16, 4, 4, ReduceLeafKind::Sum);
 }
 
 #[test]
 fn test_reduce_axis_max_staged() {
-    check_2d_reduce(Schedule::Staged, 8, 16, 4, 8, ReduceLeafKind::Max);
+    check_2d_reduce(Buffering::SINGLE, 8, 16, 4, 8, ReduceLeafKind::Max);
 }
 
 #[test]
 fn test_reduce_axis_min_staged() {
-    check_2d_reduce(Schedule::Staged, 8, 16, 4, 8, ReduceLeafKind::Min);
+    check_2d_reduce(Buffering::SINGLE, 8, 16, 4, 8, ReduceLeafKind::Min);
 }
 
 #[test]
 fn test_reduce_axis_max_double_buffered() {
-    check_2d_reduce(Schedule::DoubleBuffered, 8, 16, 4, 4, ReduceLeafKind::Max);
+    check_2d_reduce(Buffering::DOUBLE, 8, 16, 4, 4, ReduceLeafKind::Max);
 }
 
 #[test]
 fn test_reduce_axis_min_double_buffered() {
-    check_2d_reduce(Schedule::DoubleBuffered, 8, 16, 4, 4, ReduceLeafKind::Min);
+    check_2d_reduce(Buffering::DOUBLE, 8, 16, 4, 4, ReduceLeafKind::Min);
 }
 
 /// Reduction over an outer axis while retaining the innermost axis (which lines along vector width).
@@ -558,7 +631,7 @@ fn test_reduce_axis_sum_outer_axis_retained_innermost_v1() {
     let (m, k, tm, tk) = (8, 16, 4, 16);
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm)).axis(K, Cut::sequential(tk))
         })
         .build();
@@ -571,6 +644,7 @@ fn test_reduce_axis_sum_outer_axis_retained_innermost_v1() {
         space,
         ReduceLeafKind::Sum,
         1,
+        &[],
     );
 
     for j in 0..k {
@@ -586,7 +660,7 @@ fn test_reduce_axis_sum_outer_axis_retained_innermost_v4() {
     let (m, k, tm, tk) = (8, 16, 4, 16);
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm)).axis(K, Cut::sequential(tk))
         })
         .build();
@@ -599,6 +673,7 @@ fn test_reduce_axis_sum_outer_axis_retained_innermost_v4() {
         space,
         ReduceLeafKind::Sum,
         4,
+        &[],
     );
 
     for j in 0..k {
@@ -614,6 +689,7 @@ fn test_reduce_axis_sum_outer_axis_retained_innermost_v4() {
 /// [`run_reduce`], but the input is `checked(true)`: a non-divisible reduced axis leaves an
 /// overhang past the operand's real data, and only a checked operand masks it instead of reading
 /// garbage.
+#[allow(clippy::too_many_arguments)]
 fn run_reduce_checked(
     in_data: Vec<f32>,
     in_shape: Shape,
@@ -622,6 +698,7 @@ fn run_reduce_checked(
     out_axes: &[Axis],
     space: Space,
     op: ReduceLeafKind,
+    in_residence: &[Residence],
 ) -> HostData {
     let client = <TestRuntime as Runtime>::client(&Default::default());
     let f32_ty = f32::elem_type_native();
@@ -644,7 +721,9 @@ fn run_reduce_checked(
         space.cube_dim(&client),
         TileArgLaunch::new(
             in_binding.into_tensor_arg(),
-            TileSpec::direct(in_axes).checked(true),
+            TileSpec::direct(in_axes)
+                .checked(true)
+                .residence(in_residence),
         ),
         TileArgLaunch::new(out_binding.into_tensor_arg(), TileSpec::direct(out_axes)),
         space,
@@ -655,7 +734,7 @@ fn run_reduce_checked(
     HostData::from_tensor_handle(&client, out_handle, HostDataType::F32)
 }
 
-fn nondivisible_k_space(m: usize, k: usize, tk: usize, schedule: Schedule) -> Space {
+fn nondivisible_k_space(m: usize, k: usize, tk: usize, schedule: Buffering) -> Space {
     Tiling::new()
         .extents(&[(M, m), (K, k)])
         .level(WalkOrder::RowMajor, schedule, |l| {
@@ -675,8 +754,9 @@ fn test_reduce_axis_sum_nondivisible_k() {
         shape![m],
         &[M, K],
         &[M],
-        nondivisible_k_space(m, k, tk, Schedule::Direct),
+        nondivisible_k_space(m, k, tk, Buffering::SINGLE),
         ReduceLeafKind::Sum,
+        &[],
     );
 
     for i in 0..m {
@@ -696,13 +776,43 @@ fn test_reduce_axis_sum_nondivisible_k_staged() {
         shape![m],
         &[M, K],
         &[M],
-        nondivisible_k_space(m, k, tk, Schedule::Staged),
+        nondivisible_k_space(m, k, tk, Buffering::SINGLE),
         ReduceLeafKind::Sum,
+        &[Residence::Smem],
     );
 
     for i in 0..m {
         let want: f32 = data[i * k..(i + 1) * k].iter().sum();
         assert_eq!(got.get_f32(&[i]), want, "Staged sum mismatch at row {i}");
+    }
+}
+
+/// The input read where it lies, two slots deep: the ring materializes nothing, so its slots hold
+/// windows alone, read at its own region. The depth stays the level's to state, whatever the input
+/// costs.
+#[test]
+fn test_reduce_axis_sum_in_place_double_buffered() {
+    let (m, k, tk) = (4, 10, 4);
+    let data = ramp(m * k, 7);
+
+    let got = run_reduce_checked(
+        data.clone(),
+        shape![m, k],
+        shape![m],
+        &[M, K],
+        &[M],
+        nondivisible_k_space(m, k, tk, Buffering::DOUBLE),
+        ReduceLeafKind::Sum,
+        &[Residence::InPlace],
+    );
+
+    for i in 0..m {
+        let want: f32 = data[i * k..(i + 1) * k].iter().sum();
+        assert_eq!(
+            got.get_f32(&[i]),
+            want,
+            "In-place double-buffered sum mismatch at row {i}"
+        );
     }
 }
 
@@ -717,8 +827,9 @@ fn test_reduce_axis_sum_nondivisible_k_double_buffered() {
         shape![m],
         &[M, K],
         &[M],
-        nondivisible_k_space(m, k, tk, Schedule::DoubleBuffered),
+        nondivisible_k_space(m, k, tk, Buffering::DOUBLE),
         ReduceLeafKind::Sum,
+        &[Residence::Smem],
     );
 
     for i in 0..m {
@@ -742,8 +853,9 @@ fn test_reduce_axis_max_nondivisible_k() {
         shape![m],
         &[M, K],
         &[M],
-        nondivisible_k_space(m, k, tk, Schedule::Direct),
+        nondivisible_k_space(m, k, tk, Buffering::SINGLE),
         ReduceLeafKind::Max,
+        &[],
     );
 
     for i in 0..m {
@@ -752,6 +864,64 @@ fn test_reduce_axis_max_nondivisible_k() {
             .copied()
             .fold(f32::NEG_INFINITY, f32::max);
         assert_eq!(got.get_f32(&[i]), want, "Max mismatch at row {i}");
+    }
+}
+
+#[test]
+fn test_procedural_max_masks_nondivisible_k() {
+    let (m, k, tk) = (4, 6, 4);
+    let space = nondivisible_k_space(m, k, tk, Buffering::SINGLE);
+    let client = <TestRuntime as Runtime>::client(&Default::default());
+    let dtype = f32::elem_type_native();
+    let output = TestInput::builder(client.clone(), shape![m])
+        .dtype(dtype)
+        .zeros()
+        .generate_without_host_data();
+
+    procedural_reduce_kernel::launch::<TestRuntime>(
+        &client,
+        space.cube_count(),
+        space.cube_dim(&client),
+        TileArgLaunch::new(
+            output.clone().binding().into_tensor_arg(),
+            TileSpec::direct(&[M]),
+        ),
+        space,
+        dtype,
+    );
+
+    let got = HostData::from_tensor_handle(&client, output, HostDataType::F32);
+    for row in 0..m {
+        assert_eq!(got.get_f32(&[row]), 5.0);
+    }
+}
+
+#[test]
+fn test_staged_procedural_max_masks_nondivisible_k() {
+    let (m, k, tk) = (4, 6, 4);
+    let space = nondivisible_k_space(m, k, tk, Buffering::SINGLE);
+    let client = <TestRuntime as Runtime>::client(&Default::default());
+    let dtype = f32::elem_type_native();
+    let output = TestInput::builder(client.clone(), shape![m])
+        .dtype(dtype)
+        .zeros()
+        .generate_without_host_data();
+
+    staged_procedural_reduce_kernel::launch::<TestRuntime>(
+        &client,
+        space.cube_count(),
+        space.cube_dim(&client),
+        TileArgLaunch::new(
+            output.clone().binding().into_tensor_arg(),
+            TileSpec::direct(&[M]),
+        ),
+        space,
+        dtype,
+    );
+
+    let got = HostData::from_tensor_handle(&client, output, HostDataType::F32);
+    for row in 0..m {
+        assert_eq!(got.get_f32(&[row]), 5.0);
     }
 }
 
@@ -769,8 +939,9 @@ fn test_reduce_axis_max_nondivisible_k_negative_data() {
         shape![m],
         &[M, K],
         &[M],
-        nondivisible_k_space(m, k, tk, Schedule::Direct),
+        nondivisible_k_space(m, k, tk, Buffering::SINGLE),
         ReduceLeafKind::Max,
+        &[],
     );
 
     for i in 0..m {
@@ -795,8 +966,9 @@ fn test_reduce_axis_min_nondivisible_k_positive_data() {
         shape![m],
         &[M, K],
         &[M],
-        nondivisible_k_space(m, k, tk, Schedule::Direct),
+        nondivisible_k_space(m, k, tk, Buffering::SINGLE),
         ReduceLeafKind::Min,
+        &[],
     );
 
     for i in 0..m {
@@ -813,7 +985,7 @@ fn test_reduce_axis_max_outer_axis_retained_innermost_v4() {
     let (m, k, tm, tk) = (8, 16, 4, 16);
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm)).axis(K, Cut::sequential(tk))
         })
         .build();
@@ -826,6 +998,7 @@ fn test_reduce_axis_max_outer_axis_retained_innermost_v4() {
         space,
         ReduceLeafKind::Max,
         4,
+        &[],
     );
 
     for j in 0..k {
@@ -845,7 +1018,7 @@ fn test_reduce_axis_min_outer_axis_retained_innermost_v4() {
     let (m, k, tm, tk) = (8, 16, 4, 16);
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm)).axis(K, Cut::sequential(tk))
         })
         .build();
@@ -858,6 +1031,7 @@ fn test_reduce_axis_min_outer_axis_retained_innermost_v4() {
         space,
         ReduceLeafKind::Min,
         4,
+        &[],
     );
 
     for j in 0..k {
@@ -878,7 +1052,7 @@ fn test_reduce_axis_sum_inner_axis_reduced_v4() {
     let (m, k, tm, tk) = (8, 16, 4, 16);
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(tm)).axis(K, Cut::sequential(tk))
         })
         .build();
@@ -891,6 +1065,7 @@ fn test_reduce_axis_sum_inner_axis_reduced_v4() {
         space,
         ReduceLeafKind::Sum,
         4,
+        &[],
     );
 
     for i in 0..m {
@@ -909,7 +1084,7 @@ fn test_reduce_axis_multi_axis_3d_middle_axis_retained_innermost_v4() {
     let (b, m, k) = (3, 4, 16);
     let space = Tiling::new()
         .extents(&[(B, b), (M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(B, Cut::sequential(1))
                 .axis(M, Cut::sequential(2))
                 .axis(K, Cut::sequential(8))
@@ -924,6 +1099,7 @@ fn test_reduce_axis_multi_axis_3d_middle_axis_retained_innermost_v4() {
         space,
         ReduceLeafKind::Sum,
         4,
+        &[],
     );
 
     for bi in 0..b {
@@ -953,7 +1129,7 @@ fn test_reduce_axis_sum_spatial_unit_lanes() {
     let k = lanes * kr;
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(m)).axis(K, Cut::unit(kr))
         })
         .build()
@@ -987,7 +1163,7 @@ fn test_reduce_axis_max_spatial_unit_lanes() {
     let k = lanes * kr;
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(m)).axis(K, Cut::unit(kr))
         })
         .build()
@@ -1023,7 +1199,7 @@ fn test_reduce_axis_min_spatial_unit_lanes() {
     let k = lanes * kr;
     let space = Tiling::new()
         .extents(&[(M, m), (K, k)])
-        .level(WalkOrder::RowMajor, Schedule::Direct, |l| {
+        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
             l.axis(M, Cut::sequential(m)).axis(K, Cut::unit(kr))
         })
         .build()

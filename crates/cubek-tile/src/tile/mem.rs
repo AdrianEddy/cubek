@@ -78,15 +78,15 @@ pub struct Store<T: Numeric> {
 /// How a [`MemData`] may be touched: whether the fill can write straight through, how the store
 /// handles overhang, and how a cooperative fill spreads. Plain data held comptime, like the
 /// [`StagePlan`] it carries.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Access {
     /// Whether the window still covers the whole buffer (constructors yes, [`at`](Tile::at) no):
     /// such a tile can be written in physical order.
     pub whole: bool,
     pub overhang: Overhang,
-    /// How this store's stages are laid out and cooperatively filled: the [`StageStorage`] layout
-    /// plus the launch's cube size. Carried from the operand's [`TileSpec`] so a fill re-derives
-    /// neither.
+    /// Where this operand lives at each level below, plus the [`StageStorage`] layout and launch
+    /// cube size its materialized levels take. Carried from the operand's [`TileSpec`] so a fill
+    /// re-derives none of them.
     pub stage: StagePlan,
 }
 
@@ -257,11 +257,7 @@ impl<T: Numeric> Tile<T> {
             "Tile::of: the projection has {} Dynamic offsets but {offsets_given} were given",
             coords.dynamic_offset_count()
         ));
-        // Stage layout: the explicit override, else derived from the operand's leaf.
-        let stage = comptime!(StagePlan {
-            layout: spec.stage.unwrap_or_else(|| StageStorage::for_leaf(leaf)),
-            units: spec.units,
-        });
+        let stage = comptime!(spec.stage_plan());
         // The binding type's own width, comptime; a packed store serves `pack` values per
         // stored element.
         let bound_width = tensor.vector_size();
@@ -381,9 +377,10 @@ pub(crate) struct StageMeta {
 
 #[cube]
 impl<T: Numeric> MemData<T> {
-    /// Cooperatively materialize a coordinate-backed source into this plain, direct memory tile.
-    /// This is the one bridge from a procedural source to ordinary tile consumers: once staged,
-    /// all later reads use the normal memory views and leaves.
+    /// Cooperatively materialize a coordinate-backed source into this plain, direct scalar memory
+    /// tile. The caller must ensure that every unit in the cube owns this destination window:
+    /// workers write cyclic positions across it. That is a property of the level's distribution,
+    /// rather than whether this window covers its backing buffer.
     pub(crate) fn fill_procedural(&mut self, src: &ProceduralData<T>, #[comptime] space: Space) {
         comptime!(assert!(
             self.store.quant.is_none()
@@ -400,9 +397,14 @@ impl<T: Numeric> MemData<T> {
         let mut i = UNIT_POS as usize;
         while i < total {
             let pos = unravel(&shape, i.fcast::<u32>());
+            // TODO: Staging has no knowledge of its eventual consumer, so this generic masked
+            // fill uses ProceduralData's zero fallback. That is not the identity for every
+            // reduction (notably Max over negative values and Min over positive values). A
+            // reduction-aware staging contract must carry either validity or the consumer's
+            // identity into this fill before staged procedural reductions can be fully correct.
             dst.write(
                 i,
-                Vector::cast_from(src.evaluate(&pos, comptime!(space.clone()))),
+                Vector::cast_from(src.evaluate_masked(&pos, comptime!(space.clone()))),
             );
             i += workers;
         }
@@ -421,7 +423,10 @@ impl<T: Numeric> MemData<T> {
                 let projection = operand.projection();
                 let leaf = comptime!(operand.leaf);
                 let vector_size = operand.vector_size();
-                let stage = operand.stage();
+                // The stage is one level down, so it takes the operand's plan from the next level
+                // on: its own residence was consumed by the decision to build it.
+                let source_plan = operand.stage_plan();
+                let stage = comptime!(source_plan.descend());
 
                 if comptime!(projection.is_direct()) {
                     MemData::smem(space, leaf, vector_size, stage)
@@ -450,7 +455,8 @@ impl<T: Numeric> MemData<T> {
         let space = comptime!(operand.space.divide());
         let leaf = comptime!(operand.leaf);
         let vector_size = operand.vector_size();
-        let stage = operand.stage();
+        let source_plan = operand.stage_plan();
+        let stage = comptime!(source_plan.descend());
         match &operand.tile_kind {
             TileKind::Gmem(g) | TileKind::Smem(g) => {
                 #[comptime]
@@ -509,7 +515,7 @@ impl<T: Numeric> MemData<T> {
         #[comptime] vector_size: usize,
         #[comptime] stage: StagePlan,
     ) -> Tile<T> {
-        let form = comptime!(StageForm::dense(&space, vector_size, stage.layout));
+        let form = comptime!(StageForm::dense(&space, vector_size, stage.storage));
         let map = RuntimeMap::integral(comptime!(form.projection.physical_rank()));
         let meta = comptime!(StageMeta {
             space,
@@ -540,7 +546,7 @@ impl<T: Numeric> MemData<T> {
         let form = comptime!(StageForm::gathered(
             &space,
             vector_size,
-            stage.layout,
+            stage.storage,
             &projection
         ));
         let stage_map = RuntimeMap {
@@ -588,7 +594,7 @@ impl<T: Numeric> MemData<T> {
     ) -> Tile<T> {
         // One stored line is one served line, just narrower, so only the element and width change:
         // the layout and window below are the same grid either way.
-        let form = comptime!(StageForm::dense(&space, vector_size, stage.layout));
+        let form = comptime!(StageForm::dense(&space, vector_size, stage.storage));
         let size!(WP) = comptime!(vector_size / scheme.num_quants());
         let smem = Shared::<[Vector<I, WP>]>::new_slice(comptime!(form.cells()));
         let quant = smem_quant_info(comptime!(space.clone()), comptime!(scheme));
@@ -976,9 +982,10 @@ impl<T: Numeric> MemData<T> {
         }
     }
 
-    /// How this store's stages are laid out and filled, carried from the operand's [`TileSpec`].
-    pub(crate) fn stage(&self) -> comptime_type!(StagePlan) {
-        comptime!(self.access.stage)
+    /// Where this operand lives at each level below, and how a materialized level lays its buffer
+    /// out; carried from the operand's [`TileSpec`].
+    pub(crate) fn stage_plan(&self) -> comptime_type!(StagePlan) {
+        comptime!(self.access.stage.clone())
     }
 
     /// How far this store's quantized form travels ([`DequantAt`]). A plain store answers
@@ -1560,10 +1567,12 @@ impl<T: Numeric> MemData<T> {
             map,
             offsets: self.offsets.clone(),
             window_start: start,
-            // The window no longer covers the buffer, so the straight-through fill is off.
+            // The window no longer covers the buffer, so the straight-through fill is off. The
+            // plan descends with the space: this level's residence is behind us now.
             access: comptime!(Access {
                 whole: false,
-                ..self.access
+                overhang: self.access.overhang,
+                stage: self.access.stage.descend(),
             }),
             lane_share: comptime!(join_lane_share(self.lane_share, space.lane_share())),
         }
@@ -2254,10 +2263,10 @@ mod tests {
         let seq = |edge| Cut::sequential(edge);
         Tiling::new()
             .extents(&[(M, 16), (N, 16)])
-            .level(WalkOrder::RowMajor, Schedule::Staged, |l| {
+            .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
                 l.axis(M, seq(8)).axis(N, seq(8))
             })
-            .level(WalkOrder::RowMajor, Schedule::Staged, |l| {
+            .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
                 l.axis(M, seq(4)).axis(N, seq(4))
             })
             .build()
@@ -2268,7 +2277,7 @@ mod tests {
         let seq = |edge| Cut::sequential(edge);
         Tiling::new()
             .extents(&[(M, 16), (N, 16), (K, 8)])
-            .level(WalkOrder::RowMajor, Schedule::Staged, |l| {
+            .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
                 l.axis(M, seq(8)).axis(N, seq(8)).axis(K, seq(4))
             })
             .build()

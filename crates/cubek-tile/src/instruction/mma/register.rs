@@ -44,10 +44,14 @@ pub(crate) fn mma_register_memory<E: Numeric, EL: Numeric, ER: Numeric>(
 
     let lhs_gathered = lhs.gathered();
     let rhs_gathered = rhs.gathered();
+    let lhs_procedural = lhs.is_procedural();
+    let rhs_procedural = rhs.is_procedural();
     let nd = comptime!(
         Space::contracted(&[&lhs.space, &rhs.space], &space).len() > 1
             || lhs_gathered
             || rhs_gathered
+            || lhs_procedural
+            || rhs_procedural
     );
     if nd {
         if comptime!(pack_l == 1) {
@@ -217,6 +221,10 @@ fn mma_register_gather<
 
     let lhs_view = lhs.nd::<IL, WPL, L>();
     let rhs_view = rhs.nd::<IR, WPR, V>();
+    // Loop-invariant, and `comptime!`-bound so the `unroll` flag below stays a comptime binding:
+    // `#[unroll(flag)]` silently rolls the loop when the macro cannot see `flag` as one.
+    let lhs_check = comptime!(lhs_view.check);
+    let rhs_check = comptime!(rhs_view.check);
 
     for mat in 0..matrices {
         let batch = unravel(
@@ -231,8 +239,6 @@ fn mma_register_gather<
         let mut acc = acc.matrix_accumulate::<V>(mat, comptime!(space.clone()));
 
         // Unroll only when no mask, otherwise compilation too long.
-        let lhs_check = comptime!(lhs_view.check);
-        let rhs_check = comptime!(rhs_view.check);
         let acc_check = acc.check();
         let unroll = comptime!(mr * nr <= UNROLL_BLOCK && !lhs_check && !rhs_check && !acc_check);
         let mut c = load_accumulators(&mut acc, comptime!(mr), comptime!(nr), unroll);

@@ -1,5 +1,6 @@
 //! Lowering `c.reduce_axis(input, inst)`: at a final tile, the leaf instruction; while levels remain,
-//! walk this level under its [`Schedule`].
+//! walk this level under its [`Buffering`]. One walk serves every level: what the input costs is
+//! its own [`Residence`], and an input that stays put rides a ring of slots that allocate nothing.
 
 use cubecl::prelude::*;
 use cubecl::std::tensor::layout::CoordsDyn;
@@ -23,11 +24,7 @@ impl<Acc: Numeric> Tile<Acc> {
             Partitioner::Final => reduce_leaf(self, input, inst),
             Partitioner::Level(level) => {
                 let op_space = self.reduce_op_space(input);
-                match comptime!(level.schedule()) {
-                    Schedule::Direct => self.reduce_direct(input, inst, op_space),
-                    Schedule::Staged => self.reduce_staged(input, inst, op_space),
-                    Schedule::DoubleBuffered => self.reduce_double(input, inst, op_space),
-                }
+                self.reduce_buffered(input, inst, op_space, comptime!(level.buffering().depth()));
             }
         }
     }
@@ -141,7 +138,6 @@ fn reduce_register_data_typed<Acc: Numeric, In: Numeric, I: Numeric, WP: Size, V
     #[comptime] acc_space: Space,
     #[comptime] inst: ReduceLeafKind,
 ) {
-    let in_view = input.nd::<I, WP, V>();
     let in_space = comptime!(input.space.clone());
     let vw = input.vector_size();
     let layout = comptime!(ReduceLayout::new(&in_space, &acc_space));
@@ -152,6 +148,7 @@ fn reduce_register_data_typed<Acc: Numeric, In: Numeric, I: Numeric, WP: Size, V
         total_acc == count * acc.vector_size,
         "reduce: RegisterData shape mismatch with accumulator space"
     ));
+    let in_view = input.nd::<I, WP, V>();
 
     #[unroll]
     for a in 0..total_acc {
@@ -209,7 +206,6 @@ fn reduce_memory_typed<Acc: Numeric, In: Numeric, I: Numeric, WP: Size, V: Size>
     #[comptime] acc_space: Space,
     #[comptime] inst: ReduceLeafKind,
 ) {
-    let in_view = input.nd::<I, WP, V>();
     let in_space = comptime!(input.space.clone());
     let vw = input.vector_size();
     let layout = comptime!(ReduceLayout::new(&in_space, &acc_space));
@@ -224,6 +220,7 @@ fn reduce_memory_typed<Acc: Numeric, In: Numeric, I: Numeric, WP: Size, V: Size>
     ));
     let total_lines = comptime!(total_acc / ws);
     let mut acc_view = acc.flat_accumulate::<W>();
+    let in_view = input.nd::<I, WP, V>();
 
     for line_idx in 0..total_lines {
         let seed_vec = acc_view.seed(line_idx, inst);
@@ -256,7 +253,7 @@ fn reduce_memory_typed<Acc: Numeric, In: Numeric, I: Numeric, WP: Size, V: Size>
     }
 }
 
-/// The per-element inner reduction shared by both accumulator backings: fold `input` across the
+/// The per-element inner reduction shared by both accumulator backings: fold `in_view` across the
 /// contracted axes (`layout.kc` steps) into `seed`, for the single accumulator cell at
 /// `acc_coords`. Only the seed/commit around this loop differ between a register block (draining
 /// through `RegisterData`'s own lanes) and a memory accumulator (through [`AccumulateView`]).
@@ -273,7 +270,6 @@ fn reduce_element<Acc: Numeric, In: Numeric, V: Size>(
 ) -> Acc {
     let mut curr_val = seed;
     let kc = comptime!(layout.kc);
-
     for p in 0..kc {
         let reduce_coords = unravel(
             &const_coords(comptime!(layout.reduce_extents.clone())),
@@ -290,9 +286,8 @@ fn reduce_element<Acc: Numeric, In: Numeric, V: Size>(
             true,
         );
 
-        // `read` already returns Sum's zero identity out of bounds, so its select is dead work.
-        // Max and Min need their own identity; nested view boundaries cannot yet carry a custom
-        // fallback through every layer, so they retain the explicit outer validity predicate.
+        // Memory reads already return Sum's zero identity out of bounds; procedural reads are
+        // always valid. Max and Min retain their explicit operation-specific fallback.
         let in_vec = match comptime!(inst) {
             ReduceLeafKind::Sum => in_view.read(in_coords),
             ReduceLeafKind::Max | ReduceLeafKind::Min => {

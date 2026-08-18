@@ -31,7 +31,12 @@ use crate::*;
 /// A tile's backing store. Every variant is lifetime-free (a `Box<[T]>` or a
 /// [`cmma::Matrix`](cubecl::cmma::Matrix)); [`view`](Tile::view) rebuilds a borrowed view on
 /// demand.
-#[derive(CubeType)]
+///
+/// `Clone` copies the handle, not the cells: two clones name the same storage, so writing through
+/// one is visible through the other. That is how later ring slots reuse a fixed operand's first
+/// buffer, and it is only sound where nothing rewrites the buffer afterwards.
+#[derive(CubeType, Clone)]
+#[expand(derive(Clone))]
 pub enum TileKind<T: Numeric> {
     Gmem(MemData<T>),
     Smem(MemData<T>),
@@ -188,7 +193,8 @@ impl QuantInfo {
 /// operand whose format they are. The partitioning says how the problem is cut and nothing about
 /// what the pieces become. Operands that disagree meet the kind-pairing panics at the instruction,
 /// which is the same way every other mismatched pair is caught.
-#[derive(CubeType)]
+#[derive(CubeType, Clone)]
+#[expand(derive(Clone))]
 pub struct Tile<T: Numeric> {
     pub tile_kind: TileKind<T>,
     #[cube(comptime)]
@@ -222,9 +228,45 @@ fn bound_position(projection: &Projection, axis: Axis) -> usize {
 
 #[cube]
 impl<T: Numeric> Tile<T> {
-    /// Create a scalar, memory-free tile over a logical space. Dynamic extents are supplied by
-    /// another operand when an operation is walked; a procedural tile never witnesses them.
+    /// Whether the leaf can consume this operand in its current physical form. Opaque fragment
+    /// transports require shared memory or an already materialized fragment; scalar and manual
+    /// readers can address their source directly.
+    fn reads_in_place(&self) -> comptime_type!(bool) {
+        match &self.tile_kind {
+            TileKind::Smem(_) | TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
+                comptime!(true)
+            }
+            TileKind::Gmem(_) | TileKind::TmaGmem(_) | TileKind::Procedural(_) => {
+                comptime!(match self.leaf {
+                    Leaf::Memory => true,
+                    Leaf::Mma { io } => {
+                        matches!(io.lhs_load_method, LoadMethod::Manual)
+                            && matches!(io.rhs_load_method, LoadMethod::Manual)
+                    }
+                    Leaf::Cmma => false,
+                })
+            }
+        }
+    }
+
+    /// Create a scalar, memory-free tile over a logical space, evaluated where it is read at every
+    /// level. Dynamic extents are supplied by another operand when an operation is walked; a
+    /// procedural tile never witnesses them.
     pub fn procedural(#[comptime] space: Space, #[comptime] recipe: ProceduralRecipe) -> Self
+    where
+        T: Float,
+    {
+        Tile::<T>::procedural_resident(space, recipe, comptime!(StagePlan::in_place()))
+    }
+
+    /// [`procedural`](Tile::procedural) with the residences stated: a level asking for a stage
+    /// cooperatively materializes the recipe into it, which is how a source with no bytes reaches a
+    /// leaf that cannot evaluate one.
+    pub fn procedural_resident(
+        #[comptime] space: Space,
+        #[comptime] recipe: ProceduralRecipe,
+        #[comptime] stage: StagePlan,
+    ) -> Self
     where
         T: Float,
     {
@@ -232,6 +274,7 @@ impl<T: Numeric> Tile<T> {
             tile_kind: TileKind::new_Procedural(ProceduralData::<T>::new(
                 comptime!(space.clone()),
                 recipe,
+                stage,
             )),
             space,
             leaf: comptime!(Leaf::Memory),
@@ -250,9 +293,24 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
+    /// Whether a level above already materialized this operand into plane-private registers.
+    /// Such a payload has no bytes any transport can move, so a slot holds the fragments themselves
+    /// and each read selects the region's block out of them by comptime coordinate
+    /// ([`AtRegion`](crate::SlotPayload::AtRegion)).
+    pub fn resident_fragment(&self) -> comptime_type!(bool) {
+        match &self.tile_kind {
+            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => comptime!(true),
+            TileKind::Gmem(_)
+            | TileKind::Smem(_)
+            | TileKind::TmaGmem(_)
+            | TileKind::Procedural(_) => comptime!(false),
+        }
+    }
+
     /// How this operand's bytes move: a strided cooperative copy or a TMA hardware bulk
     /// copy. Comptime (the kind is fixed at trace); drives the staging sync. A resident
-    /// fragment is never a fill source, so it reports strided.
+    /// fragment has no bytes to move, so ask [`resident_fragment`](Tile::resident_fragment)
+    /// before this.
     pub fn delivery(&self) -> comptime_type!(Delivery) {
         match &self.tile_kind {
             TileKind::Gmem(_) | TileKind::Smem(_) => comptime!(Delivery::Copy),
@@ -262,6 +320,18 @@ impl<T: Numeric> Tile<T> {
             }
             // A procedural source is cooperatively materialized into its stage.
             TileKind::Procedural(_) => comptime!(Delivery::Procedural),
+        }
+    }
+
+    /// How a staging slot obtains this operand: transport from a backing store, or fragments a
+    /// level above already placed in registers.
+    pub fn stage_source(&self) -> comptime_type!(StageSource) {
+        let fragment = self.resident_fragment();
+        if comptime!(fragment) {
+            comptime!(StageSource::ResidentFragment)
+        } else {
+            let delivery = self.delivery();
+            comptime!(StageSource::Transport(delivery))
         }
     }
 
@@ -276,16 +346,48 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
-    /// The [`StagePlan`] a stage derived from this tile takes: its [`StageStorage`] layout
-    /// and the launch's cube size. A TMA bulk copy writes its box rows raw and a fragment
-    /// is never a fill source, so both report the plain default (strided, units unknown).
-    pub fn stage(&self) -> comptime_type!(StagePlan) {
+    /// Where this operand lives at each level from here down, and how a materialized level lays
+    /// its buffer out. A resident fragment is never a fill source and has no levels left to state,
+    /// so it answers the all-[`InPlace`](Residence::InPlace) default.
+    pub fn stage_plan(&self) -> comptime_type!(StagePlan) {
         match &self.tile_kind {
-            TileKind::Gmem(d) | TileKind::Smem(d) => d.stage(),
-            TileKind::TmaGmem(_) | TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
-                comptime!(StagePlan::strided())
+            TileKind::Gmem(d) | TileKind::Smem(d) => d.stage_plan(),
+            TileKind::TmaGmem(t) => comptime!(t.stage.clone()),
+            TileKind::Procedural(p) => comptime!(p.stage.clone()),
+            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
+                comptime!(StagePlan::in_place())
             }
-            TileKind::Procedural(_) => comptime!(StagePlan::strided()),
+        }
+    }
+
+    /// Where this operand lives at the level whose output space is `out`.
+    /// `InPlace` is honoured as stated, so a level materializes an operand only when the operand
+    /// asked it to; the one thing that cannot be honoured is a leaf reading a source it cannot
+    /// address, which is checked at the level that feeds it.
+    pub fn residence(&self, #[comptime] out: &Space) -> comptime_type!(Residence) {
+        let plan = self.stage_plan();
+        let requested = comptime!(plan.head());
+        if comptime!(requested == Residence::InPlace) {
+            let reads_in_place = self.reads_in_place();
+            comptime!(if out.partitioner().next().is_final() && !reads_in_place {
+                panic!(
+                    "Tile::residence: a {:?} leaf cannot read this operand's current physical \
+                     form in place; materialize it with Residence::Smem at \
+                     some level above the leaf",
+                    self.leaf
+                );
+            });
+            comptime!(Residence::InPlace)
+        } else {
+            let procedural = self.is_procedural();
+            comptime!(if procedural && requested == Residence::Plane {
+                panic!(
+                    "Tile::residence: a procedural source has no plane-fragment transport; state \
+                     Residence::Smem to materialize it into shared memory, or Residence::InPlace \
+                     to evaluate it at the leaf"
+                );
+            });
+            comptime!(requested)
         }
     }
 
@@ -357,6 +459,18 @@ impl<T: Numeric> Tile<T> {
     pub fn gathered(&self) -> comptime_type!(bool) {
         let projection = self.projection();
         comptime!(!projection.is_direct())
+    }
+
+    /// Whether this tile evaluates values from coordinates instead of a backing buffer.
+    pub(crate) fn is_procedural(&self) -> comptime_type!(bool) {
+        match &self.tile_kind {
+            TileKind::Procedural(_) => comptime!(true),
+            TileKind::Gmem(_)
+            | TileKind::Smem(_)
+            | TileKind::PlaneTile(_)
+            | TileKind::PlanePartition(_)
+            | TileKind::TmaGmem(_) => comptime!(false),
+        }
     }
 
     /// Whether this tile can state `axis`'s runtime size for the operation it takes part in: it
@@ -594,9 +708,9 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
-    /// Blocking copy of `src` into `self`, each kind pairing dispatched to its kind's
-    /// transport leaf. A partition source is matched first: it needs the whole
-    /// destination tile, which the pairing match below would keep borrowed.
+    /// Transfer `src` into `self`, each physical pairing dispatched to its transport leaf. A
+    /// partition source is matched first because it needs the whole destination tile, which the
+    /// pairing match below would keep borrowed.
     pub fn copy_from(&mut self, src: &Tile<T>) {
         // Bound before the match, which borrows the kind: a memory fill needs the logical space
         // both sides carry (a gathered source is addressed per axis).
@@ -621,7 +735,9 @@ impl<T: Numeric> Tile<T> {
                 (TileKind::Gmem(d) | TileKind::Smem(d), TileKind::Gmem(s) | TileKind::Smem(s)) => {
                     d.fill_from(s, space)
                 }
-                (TileKind::Smem(d), TileKind::Procedural(s)) => d.fill_procedural(s, space),
+                (TileKind::Gmem(d) | TileKind::Smem(d), TileKind::Procedural(s)) => {
+                    d.fill_procedural(s, space)
+                }
                 (TileKind::PlaneTile(_), TileKind::PlaneTile(_)) => {
                     panic!("Tile::copy_from: plane tile to plane tile cast not wired")
                 }
