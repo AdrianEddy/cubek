@@ -21,6 +21,7 @@ pub use register::*;
 pub use tma::*;
 pub use view::*;
 
+use cubecl::{ir::Scope, unexpanded};
 use cubecl::{
     prelude::*,
     quant::scheme::QuantScheme,
@@ -29,6 +30,74 @@ use cubecl::{
 };
 
 use crate::*;
+
+impl<T: Numeric> Tile<T> {
+    /// Create a coordinate-backed tile from an arbitrary procedural recipe. The concrete recipe
+    /// is erased only while CubeCL expands this call.
+    pub fn procedural<R: Recipe<T> + 'static>(_space: Space, _recipe: R) -> Self {
+        unexpanded!()
+    }
+
+    pub fn __expand_procedural<R: Recipe<T> + 'static>(
+        scope: &Scope,
+        space: Space,
+        recipe: R::ExpandType,
+    ) -> TileExpand<T> {
+        Self::__expand_procedural_resident::<R>(scope, space, recipe, StagePlan::in_place())
+    }
+
+    /// [`procedural`](Tile::procedural) with the residences stated: a level asking for a stage
+    /// cooperatively materializes the recipe into it, which is how a source with no bytes reaches
+    /// a leaf that cannot evaluate one.
+    pub fn procedural_resident<R: Recipe<T> + 'static>(
+        _space: Space,
+        _recipe: R,
+        _stage: StagePlan,
+    ) -> Self {
+        unexpanded!()
+    }
+
+    pub fn __expand_procedural_resident<R: Recipe<T> + 'static>(
+        scope: &Scope,
+        space: Space,
+        recipe: R::ExpandType,
+        stage: StagePlan,
+    ) -> TileExpand<T> {
+        Self::__expand_procedural_virtual(
+            scope,
+            space,
+            VirtualRecipe::<T>::__expand_new::<R>(scope, recipe),
+            stage,
+        )
+    }
+
+    /// Create a coordinate-backed tile yielding constant zero.
+    pub fn zeros(_space: Space) -> Self {
+        unexpanded!()
+    }
+
+    pub fn __expand_zeros(scope: &Scope, space: Space) -> TileExpand<T> {
+        Self::__expand_procedural::<Zeros>(scope, space, ZerosExpand {})
+    }
+
+    /// Create a coordinate-backed tile yielding constant one.
+    pub fn ones(_space: Space) -> Self {
+        unexpanded!()
+    }
+
+    pub fn __expand_ones(scope: &Scope, space: Space) -> TileExpand<T> {
+        Self::__expand_procedural::<Ones>(scope, space, OnesExpand {})
+    }
+
+    /// Create a coordinate-backed tile yielding a constant value.
+    pub fn constant(_space: Space, _value: T) -> Self {
+        unexpanded!()
+    }
+
+    pub fn __expand_constant(scope: &Scope, space: Space, value: NativeExpand<T>) -> TileExpand<T> {
+        Self::__expand_procedural::<Constant<T>>(scope, space, ConstantExpand::<T> { value })
+    }
+}
 
 /// A tile's backing store. Every variant is lifetime-free (a `Box<[T]>` or a
 /// [`cmma::Matrix`](cubecl::cmma::Matrix)); [`view`](Tile::view) rebuilds a borrowed view on
@@ -354,26 +423,13 @@ impl<T: Numeric> Tile<T> {
     /// Create a scalar, memory-free tile over a logical space, evaluated where it is read at every
     /// level. Dynamic extents are supplied by another operand when an operation is walked; a
     /// procedural tile never witnesses them.
-    pub fn procedural(#[comptime] space: Space, #[comptime] recipe: ProceduralRecipe) -> Self
-    where
-        T: Float,
-    {
-        Tile::<T>::procedural_resident(space, recipe, comptime!(StagePlan::in_place()))
-    }
-
-    /// [`procedural`](Tile::procedural) with the residences stated: a level asking for a stage
-    /// cooperatively materializes the recipe into it, which is how a source with no bytes reaches a
-    /// leaf that cannot evaluate one.
-    pub fn procedural_resident(
+    fn procedural_virtual(
         #[comptime] space: Space,
-        #[comptime] recipe: ProceduralRecipe,
+        recipe: VirtualRecipe<T>,
         #[comptime] stage: StagePlan,
-    ) -> Self
-    where
-        T: Float,
-    {
+    ) -> Self {
         Tile::<T> {
-            tile_kind: TileKind::new_Procedural(ProceduralData::<T>::new(
+            tile_kind: TileKind::new_Procedural(ProceduralData::<T>::new_virtual(
                 comptime!(space.clone()),
                 recipe,
                 stage,
