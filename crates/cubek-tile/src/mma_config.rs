@@ -1,4 +1,6 @@
-//! Host-side load/store method selection for the manual-mma leaf ([`Leaf::Mma`](crate::Leaf)).
+//! Host-side load/store method selection for the manual-mma leaf ([`Leaf::Mma`](crate::Leaf))
+//! and execution configuration for the software mma leaf ([`Leaf::Memory`](crate::Leaf)).
+//!
 //! Ported from cubek-std's `MmaIOConfig`: which fragment transport each role uses is a
 //! `(device, storage-type)` decision that queries [`DeviceProperties`], so it is built host-side
 //! and carried into the kernel as a comptime value on the [`Leaf`](crate::Leaf) (exactly as the
@@ -88,5 +90,32 @@ fn store_method(device_props: &DeviceProperties, dtype: ElemType) -> StoreMethod
         StoreMethod::StoreMatrix
     } else {
         StoreMethod::Manual
+    }
+}
+
+/// Execution and unrolling configuration for the software (memory/register) MMA leaf. Every
+/// field is stated by the caller: nothing here reads the device, so the same config compiles the
+/// same kernel everywhere.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct MemoryMmaConfig {
+    /// Maximum number of vector accumulator cells (mr × nr) to fully inline into registers.
+    /// Blocks larger than this remain rolled in loops to avoid register spilling.
+    pub unroll_limit: usize,
+    /// Whether to generate a dual-path specialization for masked/edge tiles (fast in-bounds path
+    /// plus checked fallback).
+    pub split_edge: bool,
+    /// Whether to walk K as (line, lane) with fixed comptime extracts, rather than as a flat
+    /// scalar walk.
+    pub lane_fanout: bool,
+}
+
+impl MemoryMmaConfig {
+    /// The only way to build one: every knob stated, none inferred.
+    pub const fn new(unroll_limit: usize, split_edge: bool, lane_fanout: bool) -> Self {
+        Self {
+            unroll_limit,
+            split_edge,
+            lane_fanout,
+        }
     }
 }

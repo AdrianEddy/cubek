@@ -2,17 +2,17 @@
 #![allow(non_snake_case)]
 
 use cubecl::{
-    TestRuntime,
     cmma::{MatrixIdent, MatrixLayout},
     features::TypeUsage,
     ir::ElemType,
     prelude::*,
     zspace::shape,
+    TestRuntime,
 };
 use cubek_quant::scheme::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
 use cubek_test_utils::{
-    HostData, HostDataType, TestInput, TestOutcome, TileInput, ValidationResult,
-    assert_equals_approx,
+    assert_equals_approx, HostData, HostDataType, TestInput, TestOutcome, TileInput,
+    ValidationResult, MEMORY_LEAF,
 };
 
 use cubek_tile::*;
@@ -243,14 +243,14 @@ fn matmul_cpu_dynamic_k() {
     .buffered(Buffering::SINGLE);
     let space = Space::new(&[(M, m), (N, n), (K, k)]).with_partitioner(partitioner);
 
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .tile(&[edge, edge])
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .tile(&[edge, edge])
         .arange();
     // Poisoned, not zeroed: the kernel owns `out = A·B` whatever the buffer held.
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .tile(&[edge, edge])
         .uniform(4242, 10., 100.);
 
@@ -478,15 +478,15 @@ fn check_matmul_batched(
     .buffered(Buffering::SINGLE);
 
     let space = Space::new(&[(B, b), (M, m), (N, n), (K, k)]).with_partitioner(partitioner.clone());
-    let a = TileInput::builder(&client, space.project(&[B, M, K]))
+    let a = TileInput::builder(&client, space.project(&[B, M, K]), MEMORY_LEAF)
         .residence(&[Residence::Smem])
         .tile(&[batch_edge, tile_edge, tile_edge])
         .arange();
-    let rhs = TileInput::builder(&client, space.project(&[B, K, N]))
+    let rhs = TileInput::builder(&client, space.project(&[B, K, N]), MEMORY_LEAF)
         .residence(&[Residence::Smem])
         .tile(&[batch_edge, tile_edge, tile_edge])
         .arange();
-    let c = TileInput::builder(&client, space.project(&[B, M, N]))
+    let c = TileInput::builder(&client, space.project(&[B, M, N]), MEMORY_LEAF)
         .tile(&[batch_edge, tile_edge, tile_edge])
         .zeros();
 
@@ -551,15 +551,15 @@ fn check_matmul_broadcast(b0: usize, b1: usize, t: usize, partitioners: &[Partit
     let out = space.project(&[B0, B1, M, N]);
     // Every level of this helper stages, whatever the caller stacked.
     let residence = vec![Residence::Smem; partitioners.len()];
-    let lhs = TileInput::builder(&client, space.project(&[B0, M, K]))
+    let lhs = TileInput::builder(&client, space.project(&[B0, M, K]), MEMORY_LEAF)
         .residence(&residence)
         .tile(&[1, t, t])
         .arange();
-    let rhs = TileInput::builder(&client, space.project(&[B1, K, N]))
+    let rhs = TileInput::builder(&client, space.project(&[B1, K, N]), MEMORY_LEAF)
         .residence(&residence)
         .tile(&[1, t, t])
         .arange();
-    let acc = TileInput::builder(&client, out.clone())
+    let acc = TileInput::builder(&client, out.clone(), MEMORY_LEAF)
         .tile(&[1, 1, t, t])
         .zeros();
 
@@ -600,14 +600,14 @@ fn check_matmul_cpu(m: usize, n: usize, k: usize, partitioner: Partitioner) {
     let tile_edge = partitioner.edge(M);
     let dtype = f32::elem_type_native();
 
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .tile(&[tile_edge, tile_edge])
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .tile(&[tile_edge, tile_edge])
         .arange();
     // Poisoned, not zeroed: the kernel owns `out = A·B` whatever the buffer held.
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .tile(&[tile_edge, tile_edge])
         .uniform(4242, 10., 100.);
 
@@ -805,15 +805,15 @@ fn matmul_staged_invariant_lhs() {
         .build();
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .residence(&[Residence::Smem, Residence::Smem])
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .residence(&[Residence::Smem, Residence::Smem])
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .untiled()
         .zeros();
 
@@ -870,13 +870,13 @@ fn register_matmul_unit_spread_n() {
         .resolve_lanes(lanes);
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .untiled()
         .zeros();
 
@@ -951,7 +951,7 @@ fn cmma_matmul_staged_n_walk_partition() {
         .build();
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), leaf)
         .residence(&[
             Residence::Smem,
             Residence::InPlace,
@@ -959,10 +959,9 @@ fn cmma_matmul_staged_n_walk_partition() {
             Residence::Plane,
             Residence::InPlace,
         ])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[
             Residence::Smem,
             Residence::InPlace,
@@ -970,11 +969,9 @@ fn cmma_matmul_staged_n_walk_partition() {
             Residence::Plane,
             Residence::InPlace,
         ])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         // Poisoned, not zeroed: the kernel zeroes the promoted accumulator.
         .uniform(4242, 10., 100.);
@@ -1047,7 +1044,7 @@ fn cmma_matmul_double_buffered_plane_stage() {
         .build();
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), leaf)
         .residence(&[
             Residence::Smem,
             Residence::InPlace,
@@ -1055,10 +1052,9 @@ fn cmma_matmul_double_buffered_plane_stage() {
             Residence::Plane,
             Residence::InPlace,
         ])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[
             Residence::Smem,
             Residence::InPlace,
@@ -1066,11 +1062,9 @@ fn cmma_matmul_double_buffered_plane_stage() {
             Residence::Plane,
             Residence::InPlace,
         ])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         .uniform(4242, 10., 100.);
 
@@ -1139,15 +1133,15 @@ fn matmul_double_buffered_with_only_the_lhs_staged() {
     let space = Space::new(&[(M, m), (N, n), (K, k)]).with_partitioner(partitioner);
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .residence(&[Residence::Smem])
         .tile(&[tile_edge, tile_edge])
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .residence(&[Residence::InPlace])
         .tile(&[tile_edge, tile_edge])
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .tile(&[tile_edge, tile_edge])
         .zeros();
 
@@ -1199,15 +1193,15 @@ fn check_matmul_multilevel(
         .with_partitioner(l0.clone())
         .with_partitioner(l1.clone());
 
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .residence(residence)
         .tile(&[final_edge, final_edge])
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .residence(residence)
         .tile(&[final_edge, final_edge])
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .tile(&[final_edge, final_edge])
         .zeros();
 
@@ -1246,15 +1240,15 @@ fn check_matmul(m: usize, n: usize, k: usize, partitioner: Partitioner) {
     let dtype = f32::elem_type_native();
     let space = Space::new(&[(M, m), (N, n), (K, k)]).with_partitioner(partitioner.clone());
 
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .residence(&[Residence::Smem])
         .tile(&[tile_edge, tile_edge])
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .residence(&[Residence::Smem])
         .tile(&[tile_edge, tile_edge])
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .tile(&[tile_edge, tile_edge])
         .zeros();
 
@@ -1402,14 +1396,14 @@ fn register_matmul_promoted_accumulator() {
     .buffered(Buffering::SINGLE);
     let space = Space::new(&[(M, m), (N, n), (K, k)]).with_partitioner(partitioner);
 
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .untiled()
         .arange();
     // Poisoned: the kernel owns `out = A·B` whatever the buffer held.
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .untiled()
         .uniform(4242, 10., 100.);
 
@@ -1469,13 +1463,13 @@ fn register_matmul_promoted_cube_plane() {
         .build();
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .untiled()
         .uniform(4242, 10., 100.);
 
@@ -1509,6 +1503,156 @@ fn register_matmul_promoted_cube_plane() {
         .enforce()
 }
 
+// ---- lined lhs: the (line, lane) K walk --------------------------------------
+
+/// The register block walks `K` as (line, lane) so the lhs's within-line component is a comptime
+/// index and `extract` names a fixed component. At a scalar lhs there is exactly one lane per line
+/// and the split is invisible, so only a *lined* lhs exercises the fan-out. The two kernels below
+/// are the scalar-lhs tests' twins with the lhs lined, one per caller of the shared walk.
+#[cube(launch)]
+fn launch_cpu_matmul_lined<E: Numeric, LV: Size, V: Size>(
+    a: &TileArg<'_, E, LV>,
+    b: &TileArg<'_, E, V>,
+    c: &TileArg<'_, E, V>,
+    #[comptime] space: Space,
+    #[define(E)] _dtype: ElemType,
+) {
+    let a = a.tile(comptime!(space.clone()));
+    let b = b.tile(comptime!(space.clone()));
+    let mut c = c.tile(space);
+    c.zero();
+    c.mma(&a, &b);
+}
+
+/// [`launch_cpu_matmul_lined`] through the promoted block instead of through the output.
+#[cube(launch)]
+fn launch_promoted_matmul_lined<E: Numeric, EA: Numeric, LV: Size, V: Size>(
+    a: &TileArg<'_, E, LV>,
+    b: &TileArg<'_, E, V>,
+    c: &TileArg<'_, E, V>,
+    #[comptime] space: Space,
+    #[define(E)] _dtype: ElemType,
+    #[define(EA)] _acc_dtype: ElemType,
+) {
+    let a = a.tile(comptime!(space.clone()));
+    let b = b.tile(comptime!(space.clone()));
+    let mut c = c.tile(space);
+    let mut acc = c.promote::<EA, _>(&a);
+    acc.zero();
+    acc.mma(&a, &b);
+    acc.drain_cast_into(&mut c);
+}
+
+/// `A·B` off row-major `arange` operands: `lhs(i, p) = i·k + p`, `rhs(p, j) = p·n + j`.
+fn arange_matmul_reference(m: usize, n: usize, k: usize) -> Vec<f32> {
+    (0..m * n)
+        .map(|idx| {
+            let (i, j) = (idx / n, idx % n);
+            (0..k).map(|p| ((i * k + p) * (p * n + j)) as f32).sum()
+        })
+        .collect()
+}
+
+/// A single-level space whose leaf takes the whole problem, the shape both lined-lhs tests drive.
+fn lined_lhs_space(m: usize, n: usize, k: usize) -> Space {
+    let partitioner = Partitioner::row_major(
+        ByAxis::new(&[(M, m), (N, n), (K, k)]),
+        ByAxis::new(&[
+            (M, Distribution::Sequential),
+            (N, Distribution::Sequential),
+            (K, Distribution::Sequential),
+        ]),
+    )
+    .buffered(Buffering::SINGLE);
+    Space::new(&[(M, m), (N, n), (K, k)]).with_partitioner(partitioner)
+}
+
+/// The memory-backed leaf with the lhs lined 2-wide along `K`: two lanes per K-line, each
+/// reaching its element by a comptime `extract` rather than a dynamic one.
+#[test]
+fn register_matmul_lined_lhs() {
+    let client = <TestRuntime as Runtime>::client(&Default::default());
+    let (m, n, k) = (4usize, 4usize, 8usize);
+    let space = lined_lhs_space(m, n, k);
+
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
+        .untiled()
+        .arange();
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
+        .untiled()
+        .arange();
+    // Poisoned, not zeroed: the kernel owns `out = A·B` whatever the buffer held.
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
+        .untiled()
+        .uniform(4242, 10., 100.);
+
+    let dtype = f32::elem_type_native();
+    launch_cpu_matmul_lined::launch::<TestRuntime>(
+        &client,
+        space.cube_count(),
+        space.cube_dim(&client),
+        2,
+        1,
+        a.arg(),
+        b.arg(),
+        c.arg(),
+        space,
+        dtype,
+    );
+
+    let output = HostData::from_tensor_handle(&client, c.handle(), HostDataType::F32);
+    let (_, expected) = TestInput::builder(client, shape![m, n])
+        .custom(arange_matmul_reference(m, n, k))
+        .generate_with_f32_host_data();
+    assert_equals_approx(&output, &expected, 1e-3)
+        .as_test_outcome()
+        .enforce()
+}
+
+/// [`register_matmul_lined_lhs`] through the promoted block: same walk, same lanes, but the
+/// accumulator never round-trips to the output between `K` steps.
+#[test]
+fn register_matmul_promoted_lined_lhs() {
+    let client = <TestRuntime as Runtime>::client(&Default::default());
+    let (m, n, k) = (4usize, 4usize, 8usize);
+    let space = lined_lhs_space(m, n, k);
+
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
+        .untiled()
+        .arange();
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
+        .untiled()
+        .arange();
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
+        .untiled()
+        .uniform(4242, 10., 100.);
+
+    let dtype = f32::elem_type_native();
+    launch_promoted_matmul_lined::launch::<TestRuntime>(
+        &client,
+        space.cube_count(),
+        space.cube_dim(&client),
+        // Lhs 2-wide along K, rhs and output 2-wide along N: both the lane fan-out and the
+        // block's own line width are off their scalar case at once.
+        2,
+        2,
+        a.arg(),
+        b.arg(),
+        c.arg(),
+        space,
+        dtype,
+        dtype,
+    );
+
+    let output = HostData::from_tensor_handle(&client, c.handle(), HostDataType::F32);
+    let (_, expected) = TestInput::builder(client, shape![m, n])
+        .custom(arange_matmul_reference(m, n, k))
+        .generate_with_f32_host_data();
+    assert_equals_approx(&output, &expected, 1e-3)
+        .as_test_outcome()
+        .enforce()
+}
+
 // ---- cmma fragment transit (tensor-core) -------------------------------------
 
 /// Round-trips a 16×16 tile through a tensor-core *accumulator* fragment with no
@@ -1526,10 +1670,12 @@ fn cmma_fragment_roundtrip() {
     let dtype = f32::elem_type_native();
     let space = Space::new(&[(M, 8), (N, 8)]);
 
-    let input = TileInput::builder(&client, space.clone())
+    let input = TileInput::builder(&client, space.clone(), MEMORY_LEAF)
         .untiled()
         .arange();
-    let output = TileInput::builder(&client, space.clone()).untiled().zeros();
+    let output = TileInput::builder(&client, space.clone(), MEMORY_LEAF)
+        .untiled()
+        .zeros();
 
     cmma_roundtrip::launch::<TestRuntime>(
         &client,
@@ -1603,13 +1749,13 @@ fn cmma_matmul_8x8x8() {
 
     let dtype = f32::elem_type_native();
     let space = Space::new(&[(M, 8), (N, 8), (K, 8)]);
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .untiled()
         .zeros();
 
@@ -1668,10 +1814,10 @@ fn cmma_matmul_quant_per_tensor_8x8x8() {
         .generate_without_host_data();
 
     // B: f32 row-major arange (b[p, j] = p·8 + j); C: zeros.
-    let b = TileInput::builder(&client, Space::new(&[(K, 8), (N, 8)]))
+    let b = TileInput::builder(&client, Space::new(&[(K, 8), (N, 8)]), MEMORY_LEAF)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, Space::new(&[(M, 8), (N, 8)]))
+    let c = TileInput::builder(&client, Space::new(&[(M, 8), (N, 8)]), MEMORY_LEAF)
         .untiled()
         .zeros();
 
@@ -1686,8 +1832,7 @@ fn cmma_matmul_quant_per_tensor_8x8x8() {
             a_input.binding().into_tensor_arg(),
             scales.binding().into_tensor_arg(),
             None.into(),
-            None.into(),
-            TileSpec::direct(&[M, K]),
+            TileSpec::direct(&[M, K], MEMORY_LEAF),
             scheme,
             DequantAt::Load,
         ),
@@ -1745,22 +1890,17 @@ fn cmma_matmul_staged_k_walk_strided_stage() {
     check_cmma_matmul_k_walk_v(16, Buffering::SINGLE, 1, StageStorage::Strided);
 }
 
-/// The leaf stated by the *operands* rather than by the partitioning, and the partitioning made to
-/// say the opposite so that reading it cannot pass unnoticed: the space declares `Cmma`, every
-/// operand declares `Register`, and the memory-accumulator microkernel is what must run.
+/// The leaf is the operands' statement and nothing else's: the partitioning says nothing about
+/// it, so the memory microkernel runs because all three operands declared it.
 ///
 /// `mma_leaf` refuses a memory accumulator under a cmma leaf ("promote it first"), reading the
-/// accumulator's own projected space. So this test fails loudly if the operand's declaration is
-/// dropped, rather than quietly running the other correct path. That check is exactly the
-/// duplicated decision the move deletes: once the format belongs to the operand, there are no two
-/// statements left to disagree.
+/// accumulator's own projected space, so this test fails loudly if an operand's declaration is
+/// dropped rather than quietly running the other correct path.
 #[test]
 fn matmul_leaf_stated_by_operands() {
     let client = <TestRuntime as Runtime>::client(&Default::default());
     let (m, n, k) = (8usize, 8usize, 8usize);
     let seq = |edge| Cut::sequential(edge);
-    // The partitioning's leaf is the wrong one on purpose: nothing may read it.
-    let leaf = Leaf::Cmma;
     let space = Tiling::new()
         .extents(&[(M, m), (N, n), (K, k)])
         .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
@@ -1769,18 +1909,15 @@ fn matmul_leaf_stated_by_operands() {
         .build();
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .residence(&[Residence::Smem])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .residence(&[Residence::Smem])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .untiled()
         .zeros();
 
@@ -1789,9 +1926,9 @@ fn matmul_leaf_stated_by_operands() {
         space.cube_count(),
         CubeDim::new_single(),
         1,
-        TileArgLaunch::new(a.tensor_arg(1), a.spec().leaf(Leaf::Memory)),
-        TileArgLaunch::new(b.tensor_arg(1), b.spec().leaf(Leaf::Memory)),
-        TileArgLaunch::new(c.tensor_arg(1), c.spec().leaf(Leaf::Memory)),
+        TileArgLaunch::new(a.tensor_arg(1), a.spec()),
+        TileArgLaunch::new(b.tensor_arg(1), b.spec()),
+        TileArgLaunch::new(c.tensor_arg(1), c.spec()),
         space,
         dtype,
     );
@@ -1835,18 +1972,15 @@ fn check_cmma_matmul_k_walk_v(k: usize, buffering: Buffering, v: usize, stage: S
         .build();
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
-        .leaf(leaf)
+    let a = TileInput::builder(&client, space.project(&[M, K]), leaf)
         .residence(&[Residence::Smem])
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
-        .leaf(leaf)
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[Residence::Smem])
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         // Poisoned, not zeroed: the kernel zeroes the promoted accumulator.
         .uniform(4242, 10., 100.);
@@ -1910,18 +2044,15 @@ fn mma_matmul_8x8x8() {
         .build();
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), leaf)
         .residence(&[Residence::Smem])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[Residence::Smem])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         // Poisoned, not zeroed: the kernel zeroes the promoted accumulator.
         .uniform(4242, 10., 100.);
@@ -1984,18 +2115,15 @@ fn cmma_matmul_plane_partitioned_stage() {
         .build();
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), leaf)
         .residence(&[Residence::Smem, Residence::InPlace])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[Residence::Smem, Residence::InPlace])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         // Poisoned, not zeroed: the kernel zeroes the promoted accumulator.
         .uniform(4242, 10., 100.);
@@ -2062,18 +2190,15 @@ fn cmma_matmul_multi_fragment_partition() {
         .build();
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), leaf)
         .residence(&[Residence::Smem, Residence::InPlace, Residence::InPlace])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[Residence::Smem, Residence::InPlace, Residence::InPlace])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         // Poisoned, not zeroed: the kernel zeroes the promoted accumulator.
         .uniform(4242, 10., 100.);
@@ -2297,10 +2422,10 @@ fn cmma_matmul_quant_block_m_8x8x8() {
 
     let space = Space::new(&[(M, 8), (N, 8), (K, 8)]);
 
-    let b = TileInput::builder(&client, Space::new(&[(K, 8), (N, 8)]))
+    let b = TileInput::builder(&client, Space::new(&[(K, 8), (N, 8)]), MEMORY_LEAF)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, Space::new(&[(M, 8), (N, 8)]))
+    let c = TileInput::builder(&client, Space::new(&[(M, 8), (N, 8)]), MEMORY_LEAF)
         .untiled()
         .zeros();
     let e_dtype = f32::elem_type_native();
@@ -2313,8 +2438,7 @@ fn cmma_matmul_quant_block_m_8x8x8() {
             a_input.binding().into_tensor_arg(),
             scales.binding().into_tensor_arg(),
             None.into(),
-            None.into(),
-            TileSpec::direct(&[M, K]),
+            TileSpec::direct(&[M, K], MEMORY_LEAF),
             scheme,
             DequantAt::Load,
         ),
@@ -2381,10 +2505,10 @@ fn cmma_matmul_quant_block_k_8x8x8() {
 
     let space = Space::new(&[(M, 8), (N, 8), (K, 8)]);
 
-    let b = TileInput::builder(&client, Space::new(&[(K, 8), (N, 8)]))
+    let b = TileInput::builder(&client, Space::new(&[(K, 8), (N, 8)]), MEMORY_LEAF)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, Space::new(&[(M, 8), (N, 8)]))
+    let c = TileInput::builder(&client, Space::new(&[(M, 8), (N, 8)]), MEMORY_LEAF)
         .untiled()
         .zeros();
     let e_dtype = f32::elem_type_native();
@@ -2397,8 +2521,7 @@ fn cmma_matmul_quant_block_k_8x8x8() {
             a_input.binding().into_tensor_arg(),
             scales.binding().into_tensor_arg(),
             None.into(),
-            None.into(),
-            TileSpec::direct(&[M, K]),
+            TileSpec::direct(&[M, K], MEMORY_LEAF),
             scheme,
             DequantAt::Load,
         ),
@@ -2494,13 +2617,11 @@ fn mma_matmul_quant_until_read() {
         .custom(vec![scale])
         .generate_without_host_data();
 
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[Residence::Smem])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         .zeros();
     let e_dtype = f32::elem_type_native();
@@ -2514,10 +2635,7 @@ fn mma_matmul_quant_until_read() {
             a_input.binding().into_tensor_arg(),
             scales.binding().into_tensor_arg(),
             None.into(),
-            None.into(),
-            TileSpec::direct(&[M, K])
-                .leaf(leaf)
-                .residence(&[Residence::Smem]),
+            TileSpec::direct(&[M, K], leaf).residence(&[Residence::Smem]),
             scheme,
             DequantAt::Read,
         ),
@@ -2588,13 +2706,11 @@ fn check_cmma_matmul_quant_k_walk(k: usize, buffering: Buffering) {
         .custom(vec![scale])
         .generate_without_host_data();
 
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[Residence::Smem])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         .zeros();
     let e_dtype = f32::elem_type_native();
@@ -2608,10 +2724,7 @@ fn check_cmma_matmul_quant_k_walk(k: usize, buffering: Buffering) {
             a_input.binding().into_tensor_arg(),
             scales.binding().into_tensor_arg(),
             None.into(),
-            None.into(),
-            TileSpec::direct(&[M, K])
-                .leaf(leaf)
-                .residence(&[Residence::Smem]),
+            TileSpec::direct(&[M, K], leaf).residence(&[Residence::Smem]),
             scheme,
             DequantAt::Load,
         ),
@@ -2686,13 +2799,11 @@ fn cmma_matmul_quant_block_m_k_walk() {
         .custom(scale_vals.clone())
         .generate_without_host_data();
 
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[Residence::Smem])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         .zeros();
     let e_dtype = f32::elem_type_native();
@@ -2706,10 +2817,7 @@ fn cmma_matmul_quant_block_m_k_walk() {
             a_input.binding().into_tensor_arg(),
             scales.binding().into_tensor_arg(),
             None.into(),
-            None.into(),
-            TileSpec::direct(&[M, K])
-                .leaf(leaf)
-                .residence(&[Residence::Smem]),
+            TileSpec::direct(&[M, K], leaf).residence(&[Residence::Smem]),
             scheme,
             DequantAt::Load,
         ),
@@ -2784,13 +2892,11 @@ fn cmma_matmul_quant_block_k_k_walk() {
         .custom(scale_vals.clone())
         .generate_without_host_data();
 
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[Residence::Smem])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         .zeros();
     let e_dtype = f32::elem_type_native();
@@ -2804,10 +2910,7 @@ fn cmma_matmul_quant_block_k_k_walk() {
             a_input.binding().into_tensor_arg(),
             scales.binding().into_tensor_arg(),
             None.into(),
-            None.into(),
-            TileSpec::direct(&[M, K])
-                .leaf(leaf)
-                .residence(&[Residence::Smem]),
+            TileSpec::direct(&[M, K], leaf).residence(&[Residence::Smem]),
             scheme,
             DequantAt::Load,
         ),
@@ -2882,13 +2985,11 @@ fn cmma_matmul_quant_block_k_k_walk_vectorized() {
         .custom(scale_vals.clone())
         .generate_without_host_data();
 
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[Residence::Smem])
-        .leaf(leaf)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
-        .leaf(leaf)
+    let c = TileInput::builder(&client, space.project(&[M, N]), leaf)
         .untiled()
         .zeros();
     let e_dtype = f32::elem_type_native();
@@ -2902,10 +3003,7 @@ fn cmma_matmul_quant_block_k_k_walk_vectorized() {
             a_input.binding().into_tensor_arg(),
             scales.binding().into_tensor_arg(),
             None.into(),
-            None.into(),
-            TileSpec::direct(&[M, K])
-                .leaf(leaf)
-                .residence(&[Residence::Smem]),
+            TileSpec::direct(&[M, K], leaf).residence(&[Residence::Smem]),
             scheme,
             DequantAt::Load,
         ),
@@ -2995,15 +3093,15 @@ fn matmul_buffered_walk_cutting_a_fragment_accumulator_unrolls() {
 
     let dtype = f32::elem_type_native();
     let staged = [Residence::InPlace, Residence::Smem];
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .residence(&staged)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .residence(&staged)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .untiled()
         // Poisoned, not zeroed: the kernel zeroes the promoted accumulator.
         .uniform(4242, 10., 100.);
@@ -3125,15 +3223,15 @@ fn check_matmul_dims_vectorized(
     let space = Space::new(&[(M, m), (N, n), (K, k)]).with_partitioner(partitioner);
 
     let dtype = f32::elem_type_native();
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .residence(residence_a)
         .untiled()
         .arange();
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .residence(residence_b)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .untiled()
         .zeros();
 
@@ -3352,7 +3450,7 @@ fn run_register_matmul_quant_packed(
         return;
     }
 
-    let a = TileInput::builder(&client, Space::new(&[(M, m), (K, k)]))
+    let a = TileInput::builder(&client, Space::new(&[(M, m), (K, k)]), MEMORY_LEAF)
         .untiled()
         .packed(&scheme, DequantAt::Read)
         .arange();
@@ -3395,11 +3493,11 @@ fn run_register_matmul_quant(
 ) {
     let space = Space::new(&[(M, m), (N, n), (K, k)]).with_partitioner(plan);
 
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .residence(residence)
         .untiled()
         .arange();
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .untiled()
         .zeros();
     let e_dtype = f32::elem_type_native();
@@ -3412,8 +3510,7 @@ fn run_register_matmul_quant(
             a_arg,
             scales_arg,
             None.into(),
-            None.into(),
-            TileSpec::direct(&[M, K]).residence(residence),
+            TileSpec::direct(&[M, K], MEMORY_LEAF).residence(residence),
             scheme,
             DequantAt::Load,
         ),
@@ -3712,19 +3809,17 @@ fn quant_until_read_refused_by_a_cmma_leaf() {
         .partitioner()
         .clone();
     let space = Space::new(&[(M, 8), (N, 8), (K, 8)]).with_partitioner(plan);
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), leaf)
         .residence(&[Residence::Smem])
-        .leaf(leaf)
         .untiled()
         .packed(&scheme, DequantAt::Load)
         .arange();
 
     let launcher = space.launcher(&client);
     launcher
-        .arg(b.tile.handle().binding())
+        .arg(b.tile.handle().binding(), leaf)
         .subspace(&[K, N])
         .vectorize(scheme.num_quants())
-        .leaf(leaf)
         .quantized(&[b.scales_binding()], scheme, DequantAt::Read)
         .build();
 }
@@ -3765,11 +3860,11 @@ fn run_register_matmul_quant_rhs(
 
     let space = Space::new(&[(M, m), (N, n), (K, k)]).with_partitioner(plan);
 
-    let a = TileInput::builder(&client, space.project(&[M, K]))
+    let a = TileInput::builder(&client, space.project(&[M, K]), MEMORY_LEAF)
         .untiled()
         .arange();
     // The weight and its per-(k, N-group) scales, minted together.
-    let b = TileInput::builder(&client, space.project(&[K, N]))
+    let b = TileInput::builder(&client, space.project(&[K, N]), MEMORY_LEAF)
         .untiled()
         .packed(&mint_scheme, dequant_at)
         .arange();
@@ -3778,7 +3873,7 @@ fn run_register_matmul_quant_rhs(
             .custom(vec![g])
             .generate_without_host_data()
     });
-    let c = TileInput::builder(&client, space.project(&[M, N]))
+    let c = TileInput::builder(&client, space.project(&[M, N]), MEMORY_LEAF)
         .untiled()
         .zeros();
     let b_dtype = u32::elem_type_native();
@@ -3788,12 +3883,12 @@ fn run_register_matmul_quant_rhs(
     // quantized RHS goes through the source builder, which binds it at the storage width.
     let launcher = space.launcher(&client);
     let a_op = launcher
-        .arg(a.handle().binding())
+        .arg(a.handle().binding(), MEMORY_LEAF)
         .subspace(&[M, K])
         .residence(residence)
         .build();
     let b_src = launcher
-        .arg(b.tile.handle().binding())
+        .arg(b.tile.handle().binding(), MEMORY_LEAF)
         .subspace(&[K, N])
         .vectorize(pack)
         .residence(residence);
@@ -3802,7 +3897,7 @@ fn run_register_matmul_quant_rhs(
     let b_op = b_src.quantized(&scales, scheme, dequant_at).build();
     // The register microkernel lines the accumulator at the RHS's served width.
     let c_op = launcher
-        .arg(c.handle().binding())
+        .arg(c.handle().binding(), MEMORY_LEAF)
         .subspace(&[M, N])
         .vectorize(pack)
         .build();

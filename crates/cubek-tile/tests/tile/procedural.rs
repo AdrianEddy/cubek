@@ -4,7 +4,7 @@ use core::f32::consts::PI;
 
 use cubecl::{Runtime, TestRuntime, prelude::*, std::tensor::TensorHandle, zspace::shape};
 use cubecl_common::{ComptimeFloat, Ratio};
-use cubek_test_utils::{HostData, HostDataType, TestInput};
+use cubek_test_utils::{HostData, HostDataType, MEMORY_LEAF, TestInput};
 use cubek_tile::*;
 
 const ROW: Axis = Axis(0);
@@ -380,7 +380,7 @@ macro_rules! output_arg {
     ($output:expr) => {
         TileArgLaunch::new(
             $output.clone().binding().into_tensor_arg(),
-            TileSpec::direct(&[ROW, COL]),
+            TileSpec::direct(&[ROW, COL], MEMORY_LEAF),
         )
     };
 }

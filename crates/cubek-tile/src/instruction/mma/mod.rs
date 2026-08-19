@@ -1,8 +1,6 @@
-//! Hardware CMMA/WMMA, manual MMA, and software outer-product GEMM microkernels.
+//! The hardware contraction leaves: a CMMA/WMMA fragment and a manual MMA fragment, each
+//! executing its own instruction. Impl blocks only; the dispatch that reaches one of them is the
+//! verb's, in `ops/matmul/lower.rs`.
 
-mod base;
 mod cmma;
 mod manual;
-mod register;
-
-pub use base::*;

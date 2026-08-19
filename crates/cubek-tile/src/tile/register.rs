@@ -3,7 +3,7 @@
 
 use cubecl::prelude::*;
 
-use crate::{instruction::sum, *};
+use crate::{instruction::plane, *};
 
 // The block's line width, as a scope-registered size rather than a generic. `RA` names the
 // vector element `data` is allocated at; `alloc` binds it to the promoting tile's width with
@@ -42,6 +42,9 @@ pub struct RegisterData<T: Numeric> {
     /// partial is not the answer until the plane's lanes are summed.
     #[cube(comptime)]
     pub(crate) lane_share: LaneShare,
+    /// Execution configuration for this register leaf.
+    #[cube(comptime)]
+    pub(crate) config: MemoryMmaConfig,
 }
 
 /// Bind the block width `RA` for the rest of the kernel's scope.
@@ -61,6 +64,7 @@ impl<T: Numeric> RegisterData<T> {
         #[comptime] n: usize,
         #[comptime] vector_size: usize,
         #[comptime] lane_share: LaneShare,
+        #[comptime] config: MemoryMmaConfig,
     ) -> RegisterData<T> {
         comptime!(assert!(
             vector_size > 0 && n.is_multiple_of(vector_size),
@@ -74,6 +78,7 @@ impl<T: Numeric> RegisterData<T> {
             mr: m,
             nr,
             lane_share,
+            config,
         }
     }
 
@@ -145,9 +150,10 @@ impl<T: Numeric> RegisterData<T> {
                 for i in 0..comptime!(self.mr) {
                     #[unroll]
                     for n in 0..comptime!(self.nr) {
-                        let combined = sum::group::<T, RA>(
+                        let combined = plane::group::<T, RA>(
                             self.data[comptime!(i * self.nr + n)],
                             comptime!(fold_mask),
+                            LeafOp::Sum,
                         );
                         let lane_in_group = UNIT_POS_X & comptime!(fold_mask as u32);
                         if lane_in_group == 0 {
@@ -155,56 +161,6 @@ impl<T: Numeric> RegisterData<T> {
                             out_lines[offset as usize] = Vector::<Out, RA>::cast_from(combined);
                         }
                     }
-                }
-            }
-        }
-    }
-
-    /// `self += lhs · rhs` over the block, one rank-1 update per scalar `K` step.
-    ///
-    /// The same contraction the memory-backed microkernel runs, minus the round trip: there the
-    /// block is seeded from the sink and committed back on every visit, so a `K` walk that
-    /// returns here repeatedly loses precision to the sink's element between visits. This one
-    /// *is* the accumulator, so the partials stay in `T` until [`store_cast_window`] drains them.
-    pub(crate) fn mma<EL: Numeric, ER: Numeric>(&mut self, lhs: &Tile<EL>, rhs: &Tile<ER>) {
-        let pack_l = lhs.quant_pack();
-        let pack_r = rhs.quant_pack();
-        let vw = rhs.vector_size();
-        let lw = lhs.vector_size();
-        comptime!(assert!(
-            pack_l == 0 && pack_r == 0,
-            "RegisterData::mma: a quantized operand against a promoted accumulator is not wired \
-             yet — the memory-backed leaf serves those (it dequantizes per read)"
-        ));
-        comptime!(assert!(
-            vw == self.vector_size,
-            "RegisterData::mma: the block's lines must match the rhs's"
-        ));
-
-        let size!(L) = lw;
-        let kc = comptime!(rhs.space.extent_at(rhs.space.rank() - 2));
-        let (mr, nr) = comptime!((self.mr, self.nr));
-
-        let lhs_mat = lhs.matrix_transparent::<EL, L, L>(0usize);
-        // The rhs and the block share the width `RA` (asserted above, `vw == self.vector_size`).
-        let rhs_mat = rhs.matrix_transparent::<ER, RA, RA>(0usize);
-        // Matches the memory-backed leaf's cap: past it, hundreds of inlined cells
-        // overflow the optimizer's recursive block pass.
-        let unroll = comptime!(mr * nr <= 64);
-
-        for p in 0..kc {
-            let mut b = Array::<Vector<T, RA>>::new(nr);
-            #[unroll(unroll)]
-            for n in 0..nr {
-                b[n] = Vector::<T, RA>::cast_from(rhs_mat.read((p as u32, n as u32)));
-            }
-            #[unroll(unroll)]
-            for i in 0..mr {
-                let lhs_line = lhs_mat.read((i as u32, (p / lw) as u32));
-                let a = Vector::<T, RA>::cast_from(lhs_line.extract_dynamic(p % lw));
-                #[unroll(unroll)]
-                for n in 0..nr {
-                    self.data[i * nr + n] = fma(a, b[n], self.data[i * nr + n]);
                 }
             }
         }

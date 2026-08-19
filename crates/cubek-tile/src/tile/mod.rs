@@ -409,7 +409,7 @@ impl<T: Numeric> Tile<T> {
             }
             TileKind::Gmem(_) | TileKind::TmaGmem(_) | TileKind::Procedural(_) => {
                 comptime!(match self.leaf {
-                    Leaf::Memory => true,
+                    Leaf::Memory { .. } => true,
                     Leaf::Mma { io } => {
                         matches!(io.lhs_load_method, LoadMethod::Manual)
                             && matches!(io.rhs_load_method, LoadMethod::Manual)
@@ -422,11 +422,13 @@ impl<T: Numeric> Tile<T> {
 
     /// Create a scalar, memory-free tile over a logical space, evaluated where it is read at every
     /// level. Dynamic extents are supplied by another operand when an operation is walked; a
-    /// procedural tile never witnesses them.
+    /// procedural tile never witnesses them. `leaf` is what will consume it, stated here like
+    /// every other operand states it.
     fn procedural_virtual(
         #[comptime] space: Space,
         recipe: VirtualRecipe<T>,
         #[comptime] stage: StagePlan,
+        #[comptime] leaf: Leaf,
     ) -> Self {
         Tile::<T> {
             tile_kind: TileKind::new_Procedural(ProceduralData::<T>::new_virtual(
@@ -435,7 +437,7 @@ impl<T: Numeric> Tile<T> {
                 stage,
             )),
             space,
-            leaf: comptime!(Leaf::Memory),
+            leaf,
         }
     }
 
