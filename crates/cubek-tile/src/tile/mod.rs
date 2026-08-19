@@ -142,6 +142,11 @@ pub struct QuantInfo {
     /// the tensor's own scales in place.
     #[cube(comptime)]
     pub(crate) scale_shape: Vec<usize>,
+    /// A lookup scheme's `2^bits`-entry table, present exactly under
+    /// [`QuantMode::Lookup`](cubecl::quant::scheme::QuantMode). Always the gmem buffer: it is at
+    /// most a few hundred cache-resident floats, so a stage carries it through rather than
+    /// copying it ([`smem_quant`](MemData::smem_quant)).
+    pub(crate) table: ComptimeOption<Box<[f32]>>,
     #[cube(comptime)]
     pub scheme: QuantScheme,
 }
@@ -240,6 +245,7 @@ impl QuantInfo {
             values,
             scales,
             known,
+            self.table.clone(),
             comptime!(self.scheme),
         )
     }
@@ -274,6 +280,7 @@ impl QuantInfo {
             extent: comptime!(extent),
             dequant_at: comptime!(self.dequant_at),
             scale_shape: comptime!(self.scale_shape.clone()),
+            table: self.table.clone(),
             scheme: comptime!(self.scheme),
         }
     }
