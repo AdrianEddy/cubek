@@ -1,11 +1,10 @@
 use cubecl::{
-    TestRuntime, client::ComputeClient, ir::ElemType, quant::scheme::QuantStore,
-    std::tensor::TensorHandle, zspace::Shape,
+    TestRuntime, client::ComputeClient, ir::ElemType, std::tensor::TensorHandle, zspace::Shape,
 };
 use cubecl_common::quant::scheme::QuantScheme;
 
 use crate::{
-    HostData, QuantizationInfo, TestTensor, stubs::quant::quantize,
+    HostData, QuantizationInfo, TestTensor, quant_layout, stubs::quant::quantize,
     test_tensor::custom::cast_f32_to_dtype,
 };
 
@@ -27,31 +26,12 @@ pub(crate) fn apply_quantization(
     // the quant range without clipping.
     let (scales_shape, scales_data, block_dims) = compute_input_scales(&tensor.host, &scheme);
 
-    // Determine the correct storage type for the quantized output buffer.
-    let output_storage_type = match &scheme.store {
-        QuantStore::PackedU32(_) => ElemType::UInt(cubecl::ir::UIntKind::U32),
-        QuantStore::PackedNative(_) | QuantStore::Native => {
-            ElemType::from_quant_value(scheme.value)
-        }
-    };
-
-    let mut quant_shape = original_shape.clone();
-    let num_quants = scheme.num_quants();
-    // Only divide last dim for PackedU32/PackedNative; Native stores 1:1.
-    match &scheme.store {
-        QuantStore::PackedU32(_) | QuantStore::PackedNative(_) => {
-            if num_quants > 1 {
-                let last_dim = quant_shape.len() - 1;
-                quant_shape[last_dim] /= num_quants;
-            }
-        }
-        QuantStore::Native => {}
-    }
-
     // Quantize on the host (see `crate::stubs::quant`). The kernel's `out_scale`
     // is simply the input scales cast to the param precision, so we build it
     // directly from `scales_data` instead of having the stub recompute it.
     let shape: Vec<usize> = original_shape.iter().copied().collect();
+    let output_storage_type = quant_layout::values_dtype(&scheme);
+    let quant_shape = Shape::from(quant_layout::values_shape(&scheme, &shape));
     let values = logical_values_f32(&tensor.host);
     let output_bytes = quantize(&values, &shape, &scales_data, &block_dims, &scheme);
     let output_handle = TensorHandle::new_contiguous(
@@ -111,51 +91,49 @@ fn compute_input_scales(host: &HostData, scheme: &QuantScheme) -> (Shape, Vec<f3
 
     let shape: Vec<usize> = host.shape.iter().copied().collect();
     let block_dims = crate::stubs::quant::block_dims(scheme, &shape);
-    let scales_shape: Shape = crate::stubs::quant::scales_shape(&shape, &block_dims)
+    let scales_shape: Shape = crate::quant_layout::scales_grid(&shape, &block_dims)
         .into_iter()
         .collect();
 
     let scales = if scheme.block_size().is_none() {
         vec![1.0 / max_abs_q]
     } else {
-        {
-            let rank = shape.len();
-            let num_blocks: usize = scales_shape.iter().product();
-            let block_elem_count: usize = block_dims.iter().product();
+        let rank = shape.len();
+        let num_blocks: usize = scales_shape.iter().product();
+        let block_elem_count: usize = block_dims.iter().product();
 
-            let mut scales = Vec::with_capacity(num_blocks);
-            let mut data_idx = vec![0usize; rank];
-            for block_linear in 0..num_blocks {
-                // Decode the flat block index into per-dim block indices.
-                let mut block_idx = vec![0usize; rank];
-                let mut rem = block_linear;
-                for d in (0..rank).rev() {
-                    block_idx[d] = rem % scales_shape[d];
-                    rem /= scales_shape[d];
-                }
-
-                let mut block_max = 0.0_f32;
-                for elem_linear in 0..block_elem_count {
-                    let mut rem = elem_linear;
-                    for d in (0..rank).rev() {
-                        let within = rem % block_dims[d];
-                        data_idx[d] = block_idx[d] * block_dims[d] + within;
-                        rem /= block_dims[d];
-                    }
-                    block_max = block_max.max(host.get_f32(&data_idx).abs());
-                }
-
-                // Guard against an all-zero block producing a zero scale that
-                // would divide-by-zero inside the quantize kernel.
-                let scale = if block_max > 0.0 {
-                    block_max / max_abs_q
-                } else {
-                    1.0 / max_abs_q
-                };
-                scales.push(scale);
+        let mut scales = Vec::with_capacity(num_blocks);
+        let mut data_idx = vec![0usize; rank];
+        for block_linear in 0..num_blocks {
+            // Decode the flat block index into per-dim block indices.
+            let mut block_idx = vec![0usize; rank];
+            let mut rem = block_linear;
+            for d in (0..rank).rev() {
+                block_idx[d] = rem % scales_shape[d];
+                rem /= scales_shape[d];
             }
-            scales
+
+            let mut block_max = 0.0_f32;
+            for elem_linear in 0..block_elem_count {
+                let mut rem = elem_linear;
+                for d in (0..rank).rev() {
+                    let within = rem % block_dims[d];
+                    data_idx[d] = block_idx[d] * block_dims[d] + within;
+                    rem /= block_dims[d];
+                }
+                block_max = block_max.max(host.get_f32(&data_idx).abs());
+            }
+
+            // Guard against an all-zero block producing a zero scale that
+            // would divide-by-zero inside the quantize kernel.
+            let scale = if block_max > 0.0 {
+                block_max / max_abs_q
+            } else {
+                1.0 / max_abs_q
+            };
+            scales.push(scale);
         }
+        scales
     };
 
     (scales_shape, scales, block_dims)
