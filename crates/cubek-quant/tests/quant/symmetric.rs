@@ -53,11 +53,10 @@ fn test_quantization_tensor_symmetric(m: usize, n: usize, value: QuantValue) {
     let output_f = TensorHandle::zeros(&client, shape, f32::elem_type_native());
 
     let scheme = QuantScheme::default()
-        .with_level(QuantLevel::Tensor)
+        .per_tensor(ScaleDtype::F32)
         .with_mode(mode)
         .with_value(value)
         .with_store(QuantStore::PackedU32(0))
-        .with_param(QuantParam::F32)
         .with_mode(QuantMode::Symmetric);
 
     // The shape is from the POV of packed u32s.
@@ -194,11 +193,10 @@ fn test_quantization_block_symmetric(m: usize, n: usize, value: QuantValue, bloc
     let output_f = TensorHandle::zeros(&client, shape, f32::elem_type_native());
 
     let scheme = QuantScheme::default()
-        .with_level(QuantLevel::block([block_size as u8]))
+        .per_block([block_size as u8], ScaleDtype::F32)
         .with_mode(mode)
         .with_value(value)
         .with_store(QuantStore::PackedU32(0))
-        .with_param(QuantParam::F32)
         .with_mode(QuantMode::Symmetric);
 
     // The shape is from the POV of packed u32s.
