@@ -22,7 +22,7 @@ use crate::{
     definition::{MatmulAvailabilityError, MatmulProblem, MatmulSetupError},
     routines::{
         BlueprintStrategy, DeviceSettings, Routine,
-        cpu_gemm::{Instruction, PlaneGrid},
+        cpu_gemm::{InstructionShape, PlaneGrid},
     },
 };
 
@@ -61,12 +61,12 @@ pub struct Partition {
     pub n: usize,
 }
 
-/// A fully-resolved plan: the tensor-core [`Instruction`], each plane's fragment
+/// A fully-resolved plan: the tensor-core [`InstructionShape`], each plane's fragment
 /// [`Partition`], how many planes tile the cube's stage along `m`/`n` ([`PlaneGrid`]), and how
 /// deep each double-buffered smem stage runs along `K` (`stage_k`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CmmaBlueprint {
-    pub instruction: Instruction,
+    pub instruction: InstructionShape,
     pub partition: Partition,
     pub planes: PlaneGrid,
     /// K-stage depth in elements: a multiple of `instruction.k`, chosen by [`select`]
@@ -184,7 +184,7 @@ impl CmmaRoutine {
             }
         };
         // Pure plan validation first (backend-independent), the availability gate after.
-        // The gate covers forced plans too: they skip `select`'s hardware ladder, and an
+        // The gate covers forced plans too: they skip `select`'s hardware stages, and an
         // unsupported instruction must be `Unavailable`, not garbage.
         blueprint.validate(problem)?;
         let plane_dim = device_settings.client.properties().hardware.plane_size_max;
@@ -229,7 +229,7 @@ impl CmmaRoutine {
     }
 
     /// Pick the instruction from the hardware's cmma configs (aspect-aware, mirroring the
-    /// classic `find_instruction_size` ladder), then tile the stage with as many planes as
+    /// classic `find_instruction_size` stages), then tile the stage with as many planes as
     /// the cube dim affords, snapped to divisors of the tile grid.
     #[allow(clippy::result_large_err)]
     fn select<R: Runtime>(
@@ -324,7 +324,7 @@ impl CmmaRoutine {
             .unwrap_or(ik);
 
         Ok(CmmaBlueprint {
-            instruction: Instruction {
+            instruction: InstructionShape {
                 m: im,
                 n: inn,
                 k: ik,

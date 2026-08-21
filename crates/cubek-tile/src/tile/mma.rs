@@ -234,14 +234,14 @@ fn load_fragment<T: Numeric, N: Size, A: Numeric, B: Numeric, CD: Numeric>(
         LoadMethod::LoadMatrix => {
             comptime!(panic!(
                 "MmaData::load: the ldmatrix fast path is not yet wired for MemData windows; \
-                 build the Leaf with MmaIOConfig::manual()"
+                 state the register stage with MmaIOConfig::manual()"
             ))
         }
     }
 }
 
 /// Manual load, over the operand's storage element: `0` plain, `1` native i8, `>1` the packed-u32
-/// factor. The ladder is spelled out per call site because `#[cube]` takes neither a macro nor a
+/// factor. The stages is spelled out per call site because `#[cube]` takes neither a macro nor a
 /// closure to factor it (see the twin in `contract::memory`).
 #[cube]
 fn load_manual_dispatch<T: Numeric, N: Size, A: Numeric, B: Numeric, CD: Numeric>(
@@ -330,7 +330,7 @@ fn store_fragment<T: Numeric, Out: Numeric, A: Numeric, B: Numeric, CD: Numeric>
         StoreMethod::StoreMatrix => {
             comptime!(panic!(
                 "MmaData::store: the stmatrix fast path is not yet wired for MemData windows; \
-                 build the Leaf with MmaIOConfig::manual()"
+                 state the register stage with MmaIOConfig::manual()"
             ))
         }
     }

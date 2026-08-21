@@ -11,7 +11,7 @@ use cubecl::{
     prelude::*,
     zspace::{Shape, shape},
 };
-use cubek_test_utils::{HostData, HostDataType, MEMORY_LEAF, TestInput};
+use cubek_test_utils::{HostData, HostDataType, TestInput};
 
 use cubek_tile::*;
 
@@ -98,7 +98,6 @@ fn procedural_reduce_kernel<E: Float>(
             axis: K,
         },
         stage,
-        comptime!(output.spec.leaf),
     );
     let mut output = output.tile(space);
     reduce_body(&input, &mut output, comptime!(LeafOp::Max));
@@ -146,15 +145,15 @@ fn run(
         space.cube_dim(&client),
         TileArgLaunch::new(
             a_handle.binding().into_tensor_arg(),
-            TileSpec::direct(a_axes, MEMORY_LEAF),
+            TileSpec::direct(a_axes),
         ),
         TileArgLaunch::new(
             b_handle.binding().into_tensor_arg(),
-            TileSpec::direct(b_axes, MEMORY_LEAF),
+            TileSpec::direct(b_axes),
         ),
         TileArgLaunch::new(
             c_handle.clone().binding().into_tensor_arg(),
-            TileSpec::direct(c_axes, MEMORY_LEAF),
+            TileSpec::direct(c_axes),
         ),
         space,
         f32_ty,
@@ -167,7 +166,7 @@ fn run(
 fn plain(m: usize, n: usize, k: usize, tm: usize, tn: usize) -> HostData {
     let space = Tiling::new()
         .extents(&[(M, m), (N, n), (K, k)])
-        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
+        .instruction(Instruction::registers(16), |l| {
             l.axis(M, Cut::sequential(tm))
                 .axis(N, Cut::sequential(tn))
                 .axis(K, Cut::sequential(k))
@@ -188,7 +187,7 @@ fn plain(m: usize, n: usize, k: usize, tm: usize, tn: usize) -> HostData {
 fn plain_batched(b: usize, m: usize, n: usize, k: usize, tm: usize, tn: usize) -> HostData {
     let space = Tiling::new()
         .extents(&[(B, b), (M, m), (N, n), (K, k)])
-        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
+        .instruction(Instruction::registers(16), |l| {
             l.axis(B, Cut::sequential(1))
                 .axis(M, Cut::sequential(tm))
                 .axis(N, Cut::sequential(tn))
@@ -231,7 +230,7 @@ fn split_k_whole_reduce_at_leaf() {
 
     let space = Tiling::new()
         .extents(&[(M, m), (N, n), (K1, k1), (K2, k2)])
-        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
+        .instruction(Instruction::registers(16), |l| {
             l.axis(M, Cut::sequential(tm))
                 .axis(N, Cut::sequential(tn))
                 .axis(K1, Cut::sequential(k1))
@@ -260,7 +259,7 @@ fn split_k_major_half_walked() {
 
     let space = Tiling::new()
         .extents(&[(M, m), (N, n), (K1, k1), (K2, k2)])
-        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
+        .instruction(Instruction::registers(16), |l| {
             l.axis(M, Cut::sequential(tm))
                 .axis(N, Cut::sequential(tn))
                 .axis(K1, Cut::sequential(1))
@@ -289,7 +288,7 @@ fn split_k_with_a_batch_axis() {
 
     let space = Tiling::new()
         .extents(&[(B, b), (M, m), (N, n), (K1, k1), (K2, k2)])
-        .level(WalkOrder::RowMajor, Buffering::SINGLE, |l| {
+        .instruction(Instruction::registers(16), |l| {
             l.axis(B, Cut::sequential(1))
                 .axis(M, Cut::sequential(tm))
                 .axis(N, Cut::sequential(tn))
@@ -414,12 +413,9 @@ fn run_reduce_with_vw(
                 space.cube_dim(&client),
                 TileArgLaunch::new(
                     in_binding.into_tensor_arg(),
-                    TileSpec::direct(in_axes, MEMORY_LEAF).residence(in_residence),
+                    TileSpec::direct(in_axes).residence(in_residence),
                 ),
-                TileArgLaunch::new(
-                    out_binding.into_tensor_arg(),
-                    TileSpec::direct(out_axes, MEMORY_LEAF),
-                ),
+                TileArgLaunch::new(out_binding.into_tensor_arg(), TileSpec::direct(out_axes)),
                 space,
                 op,
                 f32_ty,
@@ -432,12 +428,9 @@ fn run_reduce_with_vw(
                 space.cube_dim(&client),
                 TileArgLaunch::new(
                     in_binding.into_tensor_arg(),
-                    TileSpec::direct(in_axes, MEMORY_LEAF).residence(in_residence),
+                    TileSpec::direct(in_axes).residence(in_residence),
                 ),
-                TileArgLaunch::new(
-                    out_binding.into_tensor_arg(),
-                    TileSpec::direct(out_axes, MEMORY_LEAF),
-                ),
+                TileArgLaunch::new(out_binding.into_tensor_arg(), TileSpec::direct(out_axes)),
                 space,
                 op,
                 f32_ty,
@@ -684,14 +677,11 @@ fn run_reduce_checked(
         space.cube_dim(&client),
         TileArgLaunch::new(
             in_binding.into_tensor_arg(),
-            TileSpec::direct(in_axes, MEMORY_LEAF)
+            TileSpec::direct(in_axes)
                 .checked(true)
                 .residence(in_residence),
         ),
-        TileArgLaunch::new(
-            out_binding.into_tensor_arg(),
-            TileSpec::direct(out_axes, MEMORY_LEAF),
-        ),
+        TileArgLaunch::new(out_binding.into_tensor_arg(), TileSpec::direct(out_axes)),
         space,
         op,
         f32_ty,
@@ -851,7 +841,7 @@ fn check_procedural_reduce(stage: StagePlan) {
         space.cube_dim(&client),
         TileArgLaunch::new(
             output.clone().binding().into_tensor_arg(),
-            TileSpec::direct(&[M], MEMORY_LEAF),
+            TileSpec::direct(&[M]),
         ),
         space,
         stage,
