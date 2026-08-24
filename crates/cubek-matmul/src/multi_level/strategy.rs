@@ -1,12 +1,9 @@
-//! Strategies built on the batch/global/stage/tile level tower.
+//! Strategies built on the batch/global/stage/tile levels.
 
 use std::fmt::Display;
 
 use cubecl::{Runtime, client::ComputeClient, prelude::TensorBinding};
-use cubek_std::{
-    InputBinding,
-    tile::{ColMajorTilingOrder, RowMajorTilingOrder},
-};
+use cubek_std::InputBinding;
 
 use crate::{
     definition::{MatmulElems, MatmulSetupError},
@@ -44,6 +41,7 @@ use crate::{
             },
             naive::launch as launch_naive,
         },
+        tile::{ColMajorTilingOrder, RowMajorTilingOrder},
     },
     routine::{BlueprintStrategy, Routine},
 };
