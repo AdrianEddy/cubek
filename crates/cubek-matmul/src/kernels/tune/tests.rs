@@ -82,6 +82,59 @@ mod candidate {
         }
     }
 
+    /// On planes wider than 32 lanes the autotune holds a cube to 256 units: a setting launching
+    /// more declines there, tried last and claiming no launch, while every smaller one it prepares
+    /// runs. On 32-lane planes, as large a cube runs.
+    #[test]
+    fn a_cube_past_256_units_declines_on_wide_planes() {
+        let key = key(1, 2048, 2048, 2048);
+        let problem = MatmulRoutineProblem::from(&key.shape());
+        let units = |hw: &Hardware, candidate: &MatmulRoutineCandidate<CubeStagedMatmulRoutine>| {
+            CubeStagedMatmulRoutine
+                .prepare(hw, &problem, candidate.strategy())
+                .ok()
+                .map(|(_, grid)| grid.launch.cube_dim.num_elems())
+        };
+        let wide = offering(devices::rdna_range());
+        let (mut declined, mut kept) = (0, 0);
+        for candidate in MatmulRoutineCandidate::list(CubeStagedMatmulRoutine, &wide) {
+            let settings = candidate.strategy();
+            match units(&wide, &candidate) {
+                Some(units) if units > 256 => {
+                    assert_eq!(candidate.blueprint(&key), None, "{settings}: {units} units");
+                    assert_eq!(
+                        candidate.priority(&key),
+                        CandidatePriority::LAST,
+                        "{settings}"
+                    );
+                    declined += 1;
+                }
+                Some(_) => {
+                    assert!(candidate.blueprint(&key).is_some(), "{settings}");
+                    kept += 1;
+                }
+                None => assert_eq!(candidate.blueprint(&key), None, "{settings}"),
+            }
+        }
+        assert!(declined > 0 && kept > 0, "{declined} declined, {kept} kept");
+        let narrow = offering(devices::strix_halo());
+        let large = MatmulRoutineCandidate::list(CubeStagedMatmulRoutine, &narrow)
+            .into_iter()
+            .filter(|candidate| units(&narrow, candidate).is_some_and(|units| units > 256))
+            .collect::<Vec<_>>();
+        assert!(
+            !large.is_empty(),
+            "no setting launches more than 256 units on 32-lane planes"
+        );
+        for candidate in large {
+            assert!(
+                candidate.blueprint(&key).is_some(),
+                "{}",
+                candidate.strategy()
+            );
+        }
+    }
+
     /// The priority is the autotune's one rule over the cube's output block: first where the block
     /// tiles the product, last where one cube covers all of it.
     #[test]
@@ -150,21 +203,36 @@ mod candidate {
     }
 
     /// On devices a dev machine cannot show: the unit routine, this kind's floor, prepares
-    /// everywhere; a routine that declines a device is tried last and claims no launch, and one that
+    /// everywhere, each of its settings but one whose cube is past 256 units on planes wider than
+    /// 32 lanes; a routine that declines a device is tried last and claims no launch, and one that
     /// prepares is placed by its block. A CPU holds fewer units a cube than one cube routine's cube
     /// of planes, so there the cube routine declines.
     #[test]
     fn every_device_keeps_the_floor_and_a_decline_claims_nothing() {
         let key = key(1, 2048, 2048, 2048);
+        let problem = MatmulRoutineProblem::from(&key.shape());
         for hw in [
             offering(devices::rdna_range()),
             offering(devices::cdna_wave64()),
             devices::wgpu_no_subgroups(),
             devices::cpu_12(),
         ] {
+            let mut floor = 0;
             for unit in MatmulRoutineCandidate::list(UnitRegistersMatmulRoutine, &hw) {
-                assert!(unit.blueprint(&key).is_some(), "{}", unit.strategy());
+                let (_, grid) = UnitRegistersMatmulRoutine
+                    .prepare(&hw, &problem, unit.strategy())
+                    .expect("the unit routine prepares everywhere");
+                let too_large = hw.properties.hardware.plane_size_max > 32
+                    && grid.launch.cube_dim.num_elems() > 256;
+                assert_eq!(
+                    unit.blueprint(&key).is_none(),
+                    too_large,
+                    "{}",
+                    unit.strategy()
+                );
+                floor += usize::from(!too_large);
             }
+            assert!(floor > 0, "no unit setting serves the device");
             let placed = |candidate_priority: CandidatePriority, claims: bool| match claims {
                 true => assert_eq!(candidate_priority, CandidatePriority::FIRST),
                 false => assert_eq!(candidate_priority, CandidatePriority::LAST),
