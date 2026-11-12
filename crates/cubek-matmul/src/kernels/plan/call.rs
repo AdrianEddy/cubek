@@ -47,25 +47,56 @@ impl MatmulCall {
         Product::of([self.lhs.tensor.kind(), self.rhs.tensor.kind()])
     }
 
-    /// What a tuning round measures for `key`: the call's rhs, and a zero float lhs as many rows
-    /// as the key's bucket stands for, or the call's lhs where none can be laid out alike.
+    /// What a tuning round measures for `key`: the product as large as the key's bucket stands
+    /// for, its inputs grown with zeros to the bucket's rows, reduction and width
+    /// ([`MatmulTuneKey::bucketed`]), so the winner is elected on the bucket's largest product
+    /// whatever order its calls come in. The call itself where nothing falls short of the bucket,
+    /// or where an input that does cannot be laid out alike: a packed or a strided one.
     pub fn representative(key: &MatmulTuneKey, call: &Self) -> Self {
-        let grown = match &call.lhs.tensor {
-            // The rows lie along the lhs's second-to-last axis.
-            StoredTensor::Plain(lhs) => (lhs.binding.shape.len().checked_sub(2))
-                .and_then(|rows| lhs.zeros_grown(&call.client, rows, key.m)),
-            StoredTensor::Packed(_) => None,
-        };
-        // A grown lhs makes a product of another shape than the caller's buffer, so the round's
-        // launches allocate their own.
-        match grown {
-            Some(lhs) => Self {
-                lhs: MatmulCallInput::plain(lhs),
+        let shape = key.shape();
+        // `[.., m, k] · [.., k, n]`: what each input's last two axes grow to.
+        let lhs = Self::grown(&call.client, &call.lhs, [shape.m, shape.k]);
+        let rhs = Self::grown(&call.client, &call.rhs, [shape.k, shape.n]);
+        match (lhs, rhs) {
+            (Some(lhs), Some(rhs)) if lhs.is_some() || rhs.is_some() => Self {
+                lhs: lhs.map_or_else(|| call.lhs.clone(), MatmulCallInput::plain),
+                rhs: rhs.map_or_else(|| call.rhs.clone(), MatmulCallInput::plain),
+                // A grown input makes a product of another shape than the caller's buffer, so
+                // the round's launches allocate their own.
                 destination: None,
                 ..call.clone()
             },
-            None => call.clone(),
+            _ => call.clone(),
         }
+    }
+
+    /// `input` grown with zeros to `extents` along its last two axes, each where it falls short:
+    /// `Some(None)` where neither does, `None` where one does and the input cannot be grown.
+    fn grown(
+        client: &Client,
+        input: &MatmulCallInput,
+        extents: [usize; 2],
+    ) -> Option<Option<PlainTensor>> {
+        let shape = input
+            .meta
+            .logical_shape()
+            .expect("a tensor's tiling describes its own rank");
+        let rank = shape.rank();
+        let short: Vec<(usize, usize)> = (rank.checked_sub(2)?..rank)
+            .zip(extents)
+            .filter(|&(axis, extent)| extent > shape[axis])
+            .collect();
+        if short.is_empty() {
+            return Some(None);
+        }
+        let StoredTensor::Plain(plain) = &input.tensor else {
+            return None;
+        };
+        let mut grown = plain.clone();
+        for (axis, extent) in short {
+            grown = grown.zeros_grown(client, axis, extent)?;
+        }
+        Some(Some(grown))
     }
 }
 

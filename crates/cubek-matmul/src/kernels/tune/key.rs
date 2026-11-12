@@ -49,13 +49,19 @@ pub struct OperandKey {
 
 /// What makes two products want the same kernel.
 ///
-/// `k` and `n` are **exact**: they are a projection's dimensions, fixed by the
-/// model config, so the key space is that architecture's handful of shapes and
-/// anchoring would merge problems whose winners differ. `m` is anchored — it is
-/// the axis a caller varies freely (batch × sequence), and it is the axis the
-/// crossovers actually live on, so its buckets are where candidates trade
-/// places. `batches` is anchored for the same reason and is 1 almost
-/// everywhere: `Linear` merges before projecting.
+/// `m` is anchored — it is the axis a caller varies freely (batch × sequence),
+/// and it is the axis the crossovers actually live on, so its buckets are where
+/// candidates trade places. `batches` is anchored for the same reason and is 1
+/// almost everywhere: `Linear` merges before projecting.
+///
+/// A float product's `k` and `n` are anchored too, where they are whole vector
+/// lines ([`MatmulTuneKey::bucketed`]). A projection's are fixed by the model
+/// config, but an attention computed as two products carries its sequence length
+/// as the scores' `n` and the weighted sum's `k`, and keyed exactly that is a
+/// tune for every length a caller meets: on a GPU where a tune takes seconds,
+/// minutes of tuning for every new clip or document length. A packed product's
+/// stay exact: its scales group `k` by blocks a bucket's representative would
+/// not keep.
 ///
 /// **The family anchors, not the derive.** cubecl's anchor attribute scales
 /// its base by the autotune level, and that level is set for how close to
@@ -71,9 +77,9 @@ pub struct MatmulTuneKey {
     /// stands for: it decides the vector widths, whether a staged routine can reach a tensor-core
     /// leaf, and what the memory-bound kernels accumulate from.
     elem: ElemType,
-    /// Reduction length.
+    /// Reduction length, anchored as [`Self::bucketed`] says for a float product.
     k: usize,
-    /// Output width.
+    /// Output width, anchored as [`Self::bucketed`] says for a float product.
     pub n: usize,
     /// Rows, anchored to the power of two above them — see `anchored`.
     pub m: usize,
@@ -172,7 +178,22 @@ impl MatmulTuneKey {
     pub fn anchored(extent: usize, max: usize) -> usize {
         extent.next_power_of_two().clamp(1, max)
     }
+
+    /// The extent a float product's `k` or `n` is keyed by: [`anchored`](Self::anchored) as `m`
+    /// is where it is a multiple of [`WHOLE_LINES`], so the bucket's representative is read at
+    /// the vector widths its members are; exact otherwise, an extent no width above one divides
+    /// being one a model fixes (a 257-token sequence, 91 classes) rather than one a caller varies.
+    pub fn bucketed(extent: usize) -> usize {
+        match extent % WHOLE_LINES == 0 {
+            true => Self::anchored(extent, 8192),
+            false => extent,
+        }
+    }
 }
+
+/// The widest vector line, in elements, any device reads an operand in: an extent this divides
+/// is read at the same widths as the power of two above it.
+pub const WHOLE_LINES: usize = 16;
 
 /// The problem as a candidate list prioritizes a candidate against it: the
 /// extents, the element, and each input as the key states it.
@@ -412,10 +433,16 @@ pub fn create_key(
         }
     };
 
+    let float = !matches!(lhs_kind, OperandKind::Quantized(_))
+        && !matches!(rhs_kind, OperandKind::Quantized(_));
+    let free = |extent: usize| match float {
+        true => MatmulTuneKey::bucketed(extent),
+        false => extent,
+    };
     MatmulTuneKey::new(
         elem,
-        k,
-        n,
+        free(k),
+        free(n),
         MatmulTuneKey::anchored(m, 8192),
         MatmulTuneKey::anchored(batches, 64),
         operand(lhs_meta, lhs_kind, MatmulOperand::Lhs),
@@ -442,6 +469,40 @@ mod tests {
         assert_eq!(MatmulTuneKey::anchored(65, 8192), 128);
         assert_eq!(MatmulTuneKey::anchored(100_000, 8192), 8192);
         assert_eq!(MatmulTuneKey::anchored(0, 64), 1);
+    }
+
+    /// A float product's `k` and `n` key by the power of two above them where whole vector lines
+    /// divide them, and exactly where none does; a packed product's always exactly.
+    #[test]
+    fn a_float_products_k_and_n_bucket_where_whole_lines_divide_them() {
+        use cubecl::quant::scheme::{QuantStore, QuantValue, ScaleDtype};
+        assert_eq!(MatmulTuneKey::bucketed(3968), 4096);
+        assert_eq!(MatmulTuneKey::bucketed(4288), 8192);
+        assert_eq!(MatmulTuneKey::bucketed(4096), 4096);
+        assert_eq!(MatmulTuneKey::bucketed(96), 128);
+        assert_eq!(MatmulTuneKey::bucketed(25088), 8192);
+        assert_eq!(MatmulTuneKey::bucketed(257), 257);
+        assert_eq!(MatmulTuneKey::bucketed(1028), 1028);
+        assert_eq!(MatmulTuneKey::bucketed(300), 300);
+
+        let extents = |key: MatmulTuneKey| (key.shape().k, key.shape().n);
+        let (m, k, n) = (64, 3968, 1088);
+        let lhs = Metadata::new([m, k], vec![k, 1]);
+        let rhs = Metadata::new([k, n], vec![n, 1]);
+        let float = create_key(F16, (&lhs, OperandKind::Float), (&rhs, OperandKind::Float));
+        assert_eq!(extents(float), (4096, 2048));
+
+        let q4 = QuantScheme::default()
+            .with_value(QuantValue::Q4S)
+            .per_block(vec![32, 1], ScaleDtype::F16)
+            .with_store(QuantStore::PackedU32(1));
+        let packed = Metadata::new([k, n], vec![1, k / 8]);
+        let packed = create_key(
+            F16,
+            (&lhs, OperandKind::Float),
+            (&packed, OperandKind::Quantized(q4)),
+        );
+        assert_eq!(extents(packed), (k, n));
     }
 
     /// An input broadcast along the batch dims is shared, however many batches the other one
