@@ -15,8 +15,9 @@ use cubek_std::routine::{PreparedLaunches, Routine};
 use cubek_std::{Hardware, Instructions, manual_mma};
 use std::sync::Arc;
 
-/// The most units the autotune lets a candidate's cube hold where the device's planes are wider
-/// than 32 lanes.
+/// The most planes' worth of units the autotune lets a candidate's cube hold on a device where a
+/// larger cube does not pay for its tuning: one whose planes are wider than 32 lanes, or one of at
+/// most [`FEW_WORKERS`] compute units.
 ///
 /// Settings name their cubes in planes, and were chosen on 32-lane planes (CUDA, Metal, wave32
 /// RDNA). A 64-lane plane doubles every cube's units, and the registers they hold at once. On a
@@ -24,18 +25,31 @@ use std::sync::Arc;
 /// of eight or sixteen planes ran 2-20x slower than the ones of one to four: 0.19-1.56 s a dispatch
 /// of one 14.5 GFLOP `f16` product, against 75-104 ms. The slowest crossed Windows' 2 s
 /// timeout and lost the device in the middle of a tune, and no key's winner, over a whole model
-/// run, had more than four planes. So there the autotune declines such a candidate, before
-/// compiling anything; a routine chosen outright still runs it.
-const WIDE_PLANE_CUBE_UNITS: u32 = 256;
+/// run, had more than four planes. On an Apple M4's 10-core GPU the larger cubes took 46% of a cold
+/// run's tuning, and the best of the cubes of at most four planes was the winner's time at the
+/// median over 126 keys, 3% short of it at worst (5% on an RTX 5090's 69, where tuning is
+/// cheap and nothing is held). So there the autotune declines such a candidate, before compiling
+/// anything; a routine chosen outright still runs it.
+const SMALL_CUBE_PLANES: u32 = 4;
 
-/// What a candidate whose cube is past [`WIDE_PLANE_CUBE_UNITS`] on wide planes declines with.
-const CUBE_TOO_LARGE_FOR_WIDE_PLANES: Refusal = Refusal::Declined {
-    why: "the autotune holds a cube on planes wider than 32 lanes to 256 units",
+/// The most compute units a GPU [`SMALL_CUBE_PLANES`] holds the autotune's cubes on has: a GPU this
+/// small fills its units with cubes of a few planes, and tunes each candidate slowly.
+const FEW_WORKERS: u32 = 16;
+
+/// What a candidate whose cube is past [`SMALL_CUBE_PLANES`] declines with there.
+const CUBE_TOO_LARGE_TO_TUNE: Refusal = Refusal::Declined {
+    why: "the autotune holds a cube to four planes on planes wider than 32 lanes and on a GPU of \
+          few compute units",
 };
 
-/// Whether the autotune runs a candidate launching `cube` on `hw` ([`WIDE_PLANE_CUBE_UNITS`]).
+/// Whether the autotune runs a candidate launching `cube` on `hw` ([`SMALL_CUBE_PLANES`]).
 fn tuned_on(hw: &Hardware, cube: &CubeDim) -> bool {
-    hw.properties.hardware.plane_size_max <= 32 || cube.num_elems() <= WIDE_PLANE_CUBE_UNITS
+    let hardware = &hw.properties.hardware;
+    let held = hardware.plane_size_max > 32
+        || hardware
+            .num_streaming_multiprocessors
+            .is_some_and(|workers| workers <= FEW_WORKERS);
+    !held || cube.num_elems() <= SMALL_CUBE_PLANES * hw.dispatch_plane_size()
 }
 
 /// One candidate of a matmul autotune's autotune: a float routine at one of its settings,
@@ -117,7 +131,7 @@ impl<R: Routine + Copy> MatmulRoutineCandidate<R> {
                 self.prepared
                     .prepare(&self.routine, &self.hw, &tensors.problem(), settings)?;
             if !tuned_on(&self.hw, &grid.launch.cube_dim) {
-                return Err(CUBE_TOO_LARGE_FOR_WIDE_PLANES);
+                return Err(CUBE_TOO_LARGE_TO_TUNE);
             }
             self.routine.dispatch_into_buffer(&tensors, blueprint, grid);
             Ok(match destination {
@@ -152,7 +166,7 @@ where
 
     /// The launch this candidate prepares for the float product of `key`'s extents, whatever its
     /// packing: what a packed key's product becomes once its inputs are decoded. `None` too where
-    /// its cube is too large for the device's wide planes ([`WIDE_PLANE_CUBE_UNITS`]).
+    /// its cube is larger than the autotune holds it to on the device ([`SMALL_CUBE_PLANES`]).
     pub fn prepared_float(&self, key: &MatmulTuneKey) -> Option<(MatmulBlueprint<M, SM>, CubeDim)> {
         let problem = MatmulRoutineProblem::from(&key.shape());
         let (blueprint, grid) = self

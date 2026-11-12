@@ -82,11 +82,12 @@ mod candidate {
         }
     }
 
-    /// On planes wider than 32 lanes the autotune holds a cube to 256 units: a setting launching
-    /// more declines there, tried last and claiming no launch, while every smaller one it prepares
-    /// runs. On 32-lane planes, as large a cube runs.
+    /// On planes wider than 32 lanes, and on a GPU of at most sixteen compute units, the autotune
+    /// holds a cube to four planes: a setting launching more declines there, tried last and
+    /// claiming no launch, while every smaller one it prepares runs. On 32-lane planes of a larger
+    /// GPU, as large a cube runs.
     #[test]
-    fn a_cube_past_256_units_declines_on_wide_planes() {
+    fn a_cube_past_four_planes_declines_where_the_autotune_holds_it() {
         let key = key(1, 2048, 2048, 2048);
         let problem = MatmulRoutineProblem::from(&key.shape());
         let units = |hw: &Hardware, candidate: &MatmulRoutineCandidate<CubeStagedMatmulRoutine>| {
@@ -95,36 +96,40 @@ mod candidate {
                 .ok()
                 .map(|(_, grid)| grid.launch.cube_dim.num_elems())
         };
-        let wide = offering(devices::rdna_range());
-        let (mut declined, mut kept) = (0, 0);
-        for candidate in MatmulRoutineCandidate::list(CubeStagedMatmulRoutine, &wide) {
-            let settings = candidate.strategy();
-            match units(&wide, &candidate) {
-                Some(units) if units > 256 => {
-                    assert_eq!(candidate.blueprint(&key), None, "{settings}: {units} units");
-                    assert_eq!(
-                        candidate.priority(&key),
-                        CandidatePriority::LAST,
-                        "{settings}"
-                    );
-                    declined += 1;
+        let mut few = offering(devices::strix_halo());
+        devices::topology(&mut few).num_streaming_multiprocessors = Some(10);
+        for held in [offering(devices::rdna_range()), few] {
+            let four_planes = 4 * held.dispatch_plane_size();
+            let (mut declined, mut kept) = (0, 0);
+            for candidate in MatmulRoutineCandidate::list(CubeStagedMatmulRoutine, &held) {
+                let settings = candidate.strategy();
+                match units(&held, &candidate) {
+                    Some(units) if units > four_planes => {
+                        assert_eq!(candidate.blueprint(&key), None, "{settings}: {units} units");
+                        assert_eq!(
+                            candidate.priority(&key),
+                            CandidatePriority::LAST,
+                            "{settings}"
+                        );
+                        declined += 1;
+                    }
+                    Some(_) => {
+                        assert!(candidate.blueprint(&key).is_some(), "{settings}");
+                        kept += 1;
+                    }
+                    None => assert_eq!(candidate.blueprint(&key), None, "{settings}"),
                 }
-                Some(_) => {
-                    assert!(candidate.blueprint(&key).is_some(), "{settings}");
-                    kept += 1;
-                }
-                None => assert_eq!(candidate.blueprint(&key), None, "{settings}"),
             }
+            assert!(declined > 0 && kept > 0, "{declined} declined, {kept} kept");
         }
-        assert!(declined > 0 && kept > 0, "{declined} declined, {kept} kept");
-        let narrow = offering(devices::strix_halo());
-        let large = MatmulRoutineCandidate::list(CubeStagedMatmulRoutine, &narrow)
+        let large_gpu = offering(devices::strix_halo());
+        let large = MatmulRoutineCandidate::list(CubeStagedMatmulRoutine, &large_gpu)
             .into_iter()
-            .filter(|candidate| units(&narrow, candidate).is_some_and(|units| units > 256))
+            .filter(|candidate| units(&large_gpu, candidate).is_some_and(|units| units > 4 * 32))
             .collect::<Vec<_>>();
         assert!(
             !large.is_empty(),
-            "no setting launches more than 256 units on 32-lane planes"
+            "no setting launches more than four 32-lane planes"
         );
         for candidate in large {
             assert!(
@@ -203,8 +208,8 @@ mod candidate {
     }
 
     /// On devices a dev machine cannot show: the unit routine, this kind's floor, prepares
-    /// everywhere, each of its settings but one whose cube is past 256 units on planes wider than
-    /// 32 lanes; a routine that declines a device is tried last and claims no launch, and one that
+    /// everywhere, each of its settings but one whose cube is past four planes where the autotune holds
+    /// it; a routine that declines a device is tried last and claims no launch, and one that
     /// prepares is placed by its block. A CPU holds fewer units a cube than one cube routine's cube
     /// of planes, so there the cube routine declines.
     #[test]
@@ -222,8 +227,13 @@ mod candidate {
                 let (_, grid) = UnitRegistersMatmulRoutine
                     .prepare(&hw, &problem, unit.strategy())
                     .expect("the unit routine prepares everywhere");
-                let too_large = hw.properties.hardware.plane_size_max > 32
-                    && grid.launch.cube_dim.num_elems() > 256;
+                let hardware = &hw.properties.hardware;
+                let held = hardware.plane_size_max > 32
+                    || hardware
+                        .num_streaming_multiprocessors
+                        .is_some_and(|w| w <= 16);
+                let too_large =
+                    held && grid.launch.cube_dim.num_elems() > 4 * hw.dispatch_plane_size();
                 assert_eq!(
                     unit.blueprint(&key).is_none(),
                     too_large,
