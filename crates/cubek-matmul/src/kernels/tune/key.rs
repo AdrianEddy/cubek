@@ -180,9 +180,11 @@ impl MatmulTuneKey {
     }
 
     /// The extent a float product's `k` or `n` is keyed by: [`anchored`](Self::anchored) as `m`
-    /// is where it is a multiple of [`WHOLE_LINES`], so the bucket's representative is read at
-    /// the vector widths its members are; exact otherwise, an extent no width above one divides
-    /// being one a model fixes (a 257-token sequence, 91 classes) rather than one a caller varies.
+    /// is where it is a multiple of [`WHOLE_LINES`], so a bucket's members are read at the same
+    /// vector widths; exact otherwise, an extent no width above one divides being one a model
+    /// fixes (a 257-token sequence, 91 classes) rather than one a caller varies. The winner is
+    /// elected on the first call of the bucket's `k` and `n` a round meets
+    /// ([`MatmulCall::representative`](crate::kernels::plan::MatmulCall::representative)).
     pub fn bucketed(extent: usize) -> usize {
         match extent % WHOLE_LINES == 0 {
             true => Self::anchored(extent, 8192),
